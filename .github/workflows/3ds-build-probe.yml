@@ -388,13 +388,20 @@ jobs:
           find_package(OpenSSL REQUIRED)
           add_executable(lagrange-3ds-tls-probe main.c)
           target_link_libraries(lagrange-3ds-tls-probe PRIVATE OpenSSL::SSL OpenSSL::Crypto ctru m)
+          target_sources(lagrange-3ds-tls-probe PRIVATE "$ENV{GITHUB_WORKSPACE}/port/3ds/pthread-tls.c")
+          target_link_options(lagrange-3ds-tls-probe PRIVATE
+              -Wl,--wrap=threadCreate -Wl,--wrap=threadExit
+              -Wl,-u,__syscall_tls_create -Wl,-u,__syscall_tls_set
+              -Wl,-u,__syscall_tls_get -Wl,-u,__syscall_tls_delete)
           ctr_create_3dsx(lagrange-3ds-tls-probe)
           EOF
             cat > /tmp/3ds-tls-probe/main.c <<'EOF'
           #include <openssl/rand.h>
           #include <openssl/ssl.h>
+          extern int lagrange_3ds_tsd_selftest(void);
           int main(void)
           {
+              if (lagrange_3ds_tsd_selftest() != 0) return 3;
               unsigned char random[32];
               if (RAND_bytes(random, sizeof(random)) != 1)
                   return 1;
@@ -752,6 +759,11 @@ jobs:
               find_package(PNG REQUIRED)
               find_package(BZip2 REQUIRED)
               target_link_libraries(app PUBLIC PNG::PNG BZip2::BZip2)
+              target_sources(app PRIVATE "${CMAKE_SOURCE_DIR}/port/3ds/pthread-tls.c")
+              target_link_options(app PRIVATE
+                  -Wl,--wrap=threadCreate -Wl,--wrap=threadExit
+                  -Wl,-u,__syscall_tls_create -Wl,-u,__syscall_tls_set
+                  -Wl,-u,__syscall_tls_get -Wl,-u,__syscall_tls_delete)
               # The archive is generated at CMake configuration time.
               set(N3DS_ROMFS "${CMAKE_BINARY_DIR}/lagrange-romfs")
               file(MAKE_DIRECTORY "${N3DS_ROMFS}")
@@ -801,6 +813,10 @@ jobs:
           mkdir -p port-report/browser
           cp /tmp/lagrange-3ds-build/lagrange.3dsx port-report/browser/
           cp /tmp/lagrange-3ds-build/app/lagrange.elf port-report/browser/
+          arm-none-eabi-nm -g port-report/browser/lagrange.elf > port-report/browser-symbols.txt
+          for symbol in __syscall_tls_create __syscall_tls_set __syscall_tls_get __syscall_tls_delete; do
+            grep -Eq "^[0-9a-fA-F]+ T $symbol$" port-report/browser-symbols.txt
+          done
           sha256sum port-report/browser/* > port-report/browser/SHA256SUMS
 
       - name: Upload diagnostics and smoke-test binary if available
@@ -900,12 +916,13 @@ jobs:
             fi
             startup="$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/cache/startup.log"
             proof="$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/cache/first-frame.ok"
-            if test -f "$startup" && grep -q LAGRANGE_3DS_TLS_FAILED "$startup"; then
-              echo "::error::Guest TLS initialization failed; see guest-startup.log"
+            if test -f "$startup" && grep -Eq 'LAGRANGE_3DS_(TSD|TLS)_FAILED' "$startup"; then
+              echo "::error::Guest thread-local storage or TLS initialization failed; see guest-startup.log"
               exit 1
             fi
             if test -f "$proof" && grep -q LAGRANGE_3DS_FIRST_FRAME "$proof" &&
-               test -f "$startup" && grep -q LAGRANGE_3DS_TLS_CONTEXT_OK "$startup" &&
+               test -f "$startup" && grep -q LAGRANGE_3DS_TSD_OK "$startup" &&
+               grep -q LAGRANGE_3DS_TLS_CONTEXT_OK "$startup" &&
                grep -q LAGRANGE_3DS_CIPHERS_OK "$startup"; then
               sleep 3
               kill -0 "$pid"

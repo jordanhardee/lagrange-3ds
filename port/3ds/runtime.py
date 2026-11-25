@@ -114,6 +114,7 @@ static int tlsError_3ds_(const char *text, size_t len, void *unused) {
     trace_3ds_(text);
     return 1;
 }
+extern int lagrange_3ds_tsd_selftest(void);
 static OSSL_PROVIDER *provider_3ds_;
 static int checkTls_3ds_(void) {
     unsigned char random[32] = {0};
@@ -176,6 +177,15 @@ fail:
     FILE *log = fopen("sdmc:/3ds/lagrange/cache/startup.log", "w");
     if (log) fclose(log);
     trace_3ds_("LAGRANGE_3DS_STORAGE_OK");
+    const int tsdStatus = lagrange_3ds_tsd_selftest();
+    if (tsdStatus != 0) {
+        char message[64];
+        snprintf(message, sizeof(message), "LAGRANGE_3DS_TSD_FAILED %d", tsdStatus);
+        trace_3ds_(message);
+        exitSoc_3ds_();
+        return 1;
+    }
+    trace_3ds_("LAGRANGE_3DS_TSD_OK");
     if (!checkTls_3ds_()) {
         fprintf(stderr, "[3DS] TLS initialization failed; see startup.log\\n");
         exitSoc_3ds_();
