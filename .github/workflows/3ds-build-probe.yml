@@ -826,10 +826,10 @@ jobs:
       - name: Launch pinned emulator with an empty virtual SD
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libegl1 libxcb-cursor0 imagemagick
           mkdir -p emulator-report
           export OUT="$PWD/emulator-report"
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libegl1 libopengl0 libglx0 libvulkan1 mesa-vulkan-drivers libxcb-cursor0 libxkbcommon-x11-0 libxcb-xkb1 libxcb-icccm4 libxcb-keysyms1 libxcb-xinerama0 libxcb-randr0 libxcb-shape0 libxcb-xfixes0 libpulse0 libasound2t64 imagemagick
           export ROM="$PWD/port-report/browser/lagrange.3dsx"
           test -s "$ROM"
           sha256sum "$ROM" > "$OUT/browser.sha256"
@@ -858,6 +858,14 @@ jobs:
           chmod +x azahar.AppImage
           ./azahar.AppImage --appimage-extract > "$OUT/appimage-extract.log"
           export EMULATOR="$PWD/squashfs-root/AppRun"
+          # Resolve AppImage libraries before starting the guest. The previous
+          # failure was a missing host libOpenGL.so.0, not a guest crash.
+          export LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib:$PWD/squashfs-root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          ldd "$PWD/squashfs-root/AppRun.wrapped" | tee "$OUT/host-library-check.txt"
+          if grep -q "not found" "$OUT/host-library-check.txt"; then
+            echo "::error::Emulator host dependencies unresolved"
+            exit 1
+          fi
           export LIBGL_ALWAYS_SOFTWARE=1 QT_QPA_PLATFORM=xcb
           xvfb-run -a -s '-screen 0 1280x1024x24' bash <<'SCRIPT'
           set -euo pipefail
@@ -869,11 +877,20 @@ jobs:
             wait "$pid" 2>/dev/null || true
             find "$XDG_DATA_HOME" -name azahar_log.txt -exec cp {} "$OUT/azahar_log.txt" \; || true
             find "$XDG_DATA_HOME" -maxdepth 6 -type d > "$OUT/virtual-sd-directories.txt" || true
+            for log in "$OUT/azahar-console.log" "$OUT/azahar_log.txt"; do
+              if test -f "$log"; then
+                echo "::group::$(basename "$log")"
+                tail -n 150 "$log" || true
+                echo "::endgroup::"
+              fi
+            done
           }
           trap cleanup EXIT
           for i in $(seq 1 90); do
             if ! kill -0 "$pid" 2>/dev/null; then
-              echo "::error::Emulator exited before guest first-frame proof"
+              rc=0
+              wait "$pid" || rc=$?
+              echo "::error::Emulator exited with status $rc before guest first-frame proof"
               exit 1
             fi
             if grep -RFq --include='*.txt' --include='*.log' LAGRANGE_3DS_FIRST_FRAME "$XDG_DATA_HOME" "$OUT/azahar-console.log"; then
