@@ -109,9 +109,56 @@ jobs:
           cp /tmp/smoke-build/lagrange-3ds-smoke.3dsx port-report/
           sha256sum port-report/*.3dsx > port-report/SHA256SUMS
 
+      - name: Restore pinned GNU libunistring source cache
+        id: unistring_cache
+        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-source-cache/libunistring-1.4.2.tar.xz
+          key: gnu-libunistring-1.4.2-5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c
+
+      - name: Fetch and verify pinned GNU libunistring source
+        id: unistring_source
+        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-source-cache
+          archive=".ci-source-cache/libunistring-1.4.2.tar.xz"
+          checksum="5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c"
+          verify() { printf '%s  %s\n' "$checksum" "$1" | sha256sum -c -; }
+          if test -f "$archive" && verify "$archive"; then
+            echo "Using verified cached source"
+          else
+            rm -f "$archive" "$archive.part"
+            for mirror in \
+              https://ftp.gnu.org/gnu \
+              https://mirrors.kernel.org/gnu \
+              https://mirrors.ibiblio.org/gnu \
+              https://ftpmirror.gnu.org; do
+              echo "Trying $mirror"
+              if curl --fail --location --proto '=https' --proto-redir '=https' \
+                   --connect-timeout 10 --max-time 60 --retry 1 --retry-max-time 80 \
+                   "$mirror/libunistring/libunistring-1.4.2.tar.xz" -o "$archive.part" \
+                   && verify "$archive.part"; then
+                mv "$archive.part" "$archive"
+                break
+              fi
+              rm -f "$archive.part"
+            done
+          fi
+          verify "$archive"
+
+      - name: Save verified GNU libunistring source cache
+        if: ${{ !cancelled() && steps.unistring_source.outcome == 'success' && steps.unistring_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .ci-source-cache/libunistring-1.4.2.tar.xz
+          key: gnu-libunistring-1.4.2-5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c
+
       - name: Cross-compile GNU libunistring
         id: unistring
-        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.unistring_source.outcome == 'success' }}
         run: |
           set -euo pipefail
           (
@@ -119,7 +166,7 @@ jobs:
             prefix="$DEVKITPRO/portlibs/3ds"
             mkdir -p /tmp/lagrange-deps
             cd /tmp/lagrange-deps
-            curl --fail --location --retry 3 https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.xz -o libunistring-1.4.2.tar.xz
+            cp "$GITHUB_WORKSPACE/.ci-source-cache/libunistring-1.4.2.tar.xz" libunistring-1.4.2.tar.xz
             echo '5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c  libunistring-1.4.2.tar.xz' | sha256sum -c -
             tar -xf libunistring-1.4.2.tar.xz
             cd libunistring-1.4.2
