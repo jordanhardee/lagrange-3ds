@@ -829,7 +829,7 @@ jobs:
           mkdir -p emulator-report
           export OUT="$PWD/emulator-report"
           sudo apt-get update
-          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libegl1 libopengl0 libglx0 libvulkan1 mesa-vulkan-drivers libxcb-cursor0 libxkbcommon-x11-0 libxcb-xkb1 libxcb-icccm4 libxcb-keysyms1 libxcb-xinerama0 libxcb-randr0 libxcb-shape0 libxcb-xfixes0 libpulse0 libasound2t64 imagemagick
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libegl1 libopengl0 libglx0 libvulkan1 mesa-vulkan-drivers libxcb-cursor0 libxkbcommon-x11-0 libxcb-xkb1 libxcb-icccm4 libxcb-keysyms1 libxcb-xinerama0 libxcb-randr0 libxcb-shape0 libxcb-xfixes0 libjack-jackd2-0 libpulse0 libasound2t64 imagemagick
           export ROM="$PWD/port-report/browser/lagrange.3dsx"
           test -s "$ROM"
           sha256sum "$ROM" > "$OUT/browser.sha256"
