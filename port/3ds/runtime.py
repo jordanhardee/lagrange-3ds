@@ -13,7 +13,7 @@ def edit(path, replacements):
 def sdl(root):
     # A guest-side marker proves the dual-display update path was reached.
     edit(root / "src/video/n3ds/SDL_n3dsframebuffer.c", [
-        ('#include "SDL_n3dsvideo.h"', '#include "SDL_n3dsvideo.h"\n#include <3ds/svc.h>'),
+        ('#include "SDL_n3dsvideo.h"', '#include "SDL_n3dsvideo.h"\n#include <3ds/svc.h>\n#include <stdio.h>'),
         ("            FlushN3DSBuffer(dst, fbw * fbh * sizeof(u32), (gfxScreen_t)screen);\n        }\n        return true;",
          """            FlushN3DSBuffer(dst, fbw * fbh * sizeof(u32), (gfxScreen_t)screen);
         }
@@ -21,6 +21,11 @@ def sdl(root):
         if (!reported) {
             static const char marker[] = "LAGRANGE_3DS_FIRST_FRAME";
             svcOutputDebugString(marker, sizeof(marker) - 1);
+            FILE *proof = fopen("sdmc:/3ds/lagrange/cache/first-frame.ok", "w");
+            if (proof) {
+                fputs(marker, proof);
+                fclose(proof);
+            }
             reported = true;
         }
         return true;"""),
@@ -85,6 +90,65 @@ static const char *defaultDownloadDir_App_ = "~/Downloads";
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <string.h>
+#include <3ds/svc.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+#include <openssl/provider.h>
+
+/* This port uses the built-in default provider. Do not try loading a
+   desktop OpenSSL configuration or modules from the cross-build prefix. */
+static void trace_3ds_(const char *message) {
+    svcOutputDebugString(message, strlen(message));
+    FILE *log = fopen("sdmc:/3ds/lagrange/cache/startup.log", "a");
+    if (log) {
+        fputs(message, log);
+        fputc('\\n', log);
+        fclose(log);
+    }
+}
+static int tlsError_3ds_(const char *text, size_t len, void *unused) {
+    (void) unused;
+    (void) len;
+    trace_3ds_(text);
+    return 1;
+}
+static OSSL_PROVIDER *provider_3ds_;
+static int checkTls_3ds_(void) {
+    unsigned char random[32] = {0};
+    SSL_CTX *ctx = NULL;
+    trace_3ds_("LAGRANGE_3DS_TLS_INIT");
+    if (!OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG | OPENSSL_INIT_LOAD_SSL_STRINGS, NULL))
+        goto fail;
+    trace_3ds_("LAGRANGE_3DS_TLS_INIT_OK");
+    provider_3ds_ = OSSL_PROVIDER_load(NULL, "default");
+    if (!provider_3ds_) goto fail;
+    trace_3ds_("LAGRANGE_3DS_TLS_PROVIDER_OK");
+    if (RAND_bytes(random, sizeof(random)) != 1) goto fail;
+    OPENSSL_cleanse(random, sizeof(random));
+    trace_3ds_("LAGRANGE_3DS_TLS_RNG_OK");
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) goto fail;
+    if (!SSL_CTX_set_cipher_list(ctx,
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-GCM-SHA256:"
+        "DHE-RSA-AES256-GCM-SHA384")) goto fail;
+    SSL_CTX_free(ctx);
+    trace_3ds_("LAGRANGE_3DS_TLS_CONTEXT_OK");
+    return 1;
+fail:
+    OPENSSL_cleanse(random, sizeof(random));
+    trace_3ds_("LAGRANGE_3DS_TLS_FAILED");
+    ERR_print_errors_cb(tlsError_3ds_, NULL);
+    SSL_CTX_free(ctx);
+    if (provider_3ds_) {
+        OSSL_PROVIDER_unload(provider_3ds_);
+        provider_3ds_ = NULL;
+    }
+    return 0;
+}
 #endif
 """),
         ("    init_Foundation();",
@@ -107,8 +171,28 @@ static const char *defaultDownloadDir_App_ = "~/Downloads";
             return 1;
         }
     }
+    /* Foundation assumes SSL_CTX_new succeeds. Fail before entering it
+       if TLS cannot initialize; never continue with an invalid context. */
+    FILE *log = fopen("sdmc:/3ds/lagrange/cache/startup.log", "w");
+    if (log) fclose(log);
+    trace_3ds_("LAGRANGE_3DS_STORAGE_OK");
+    if (!checkTls_3ds_()) {
+        fprintf(stderr, "[3DS] TLS initialization failed; see startup.log\\n");
+        exitSoc_3ds_();
+        return 1;
+    }
 #endif
     init_Foundation();"""),
+        ("    init_Core();",
+         """#ifdef __3DS__
+    trace_3ds_("LAGRANGE_3DS_FOUNDATION_OK");
+#endif
+    init_Core();"""),
+        ('    /* SDL configures per-monitor DPI awareness automatically. */',
+         """#ifdef __3DS__
+    trace_3ds_("LAGRANGE_3DS_CIPHERS_OK");
+#endif
+    /* SDL configures per-monitor DPI awareness automatically. */"""),
     ])
     edit(root / "app/src/app/startup.c", [
         ("        const char *paths[] = {\n",

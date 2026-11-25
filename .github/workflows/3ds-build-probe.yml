@@ -362,7 +362,7 @@ jobs:
           EOF
             CC=arm-none-eabi-gcc AR=arm-none-eabi-ar RANLIB=arm-none-eabi-ranlib \
               perl Configure nintendo-3ds --prefix="$prefix" --libdir=lib \
-                --openssldir=sdmc:/3ds/lagrange/openssl \
+                --openssldir=/3ds/lagrange/openssl \
                 -D__3DS__ -DOPENSSL_USE_IPV6=0 -DOPENSSL_NO_UNIX_SOCK -DNO_SYSLOG -I"$DEVKITPRO/libctru/include" -I"$prefix/include" \
                 no-shared no-dso no-module no-asm no-async no-engine no-tests no-apps \
                 no-thread-pool no-ui-console no-quic --with-rand-seed=os
@@ -872,12 +872,17 @@ jobs:
           "$EMULATOR" "$ROM" > "$OUT/azahar-console.log" 2>&1 &
           pid=$!
           cleanup() {
-            import -window root "$OUT/screenshot.png" 2>/dev/null || true
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
+            timeout 5s import -window root "$OUT/screenshot.png" 2>/dev/null || true
+            # Azahar can block on a modal guest exception. Capture diagnostics
+            # before stopping it and never wait indefinitely on that dialog.
             find "$XDG_DATA_HOME" -name azahar_log.txt -exec cp {} "$OUT/azahar_log.txt" \; || true
+            find "$XDG_DATA_HOME" -name startup.log -exec cp {} "$OUT/guest-startup.log" \; || true
             find "$XDG_DATA_HOME" -maxdepth 6 -type d > "$OUT/virtual-sd-directories.txt" || true
-            for log in "$OUT/azahar-console.log" "$OUT/azahar_log.txt"; do
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            for log in "$OUT/azahar-console.log" "$OUT/azahar_log.txt" "$OUT/guest-startup.log"; do
               if test -f "$log"; then
                 echo "::group::$(basename "$log")"
                 tail -n 150 "$log" || true
@@ -893,7 +898,15 @@ jobs:
               echo "::error::Emulator exited with status $rc before guest first-frame proof"
               exit 1
             fi
-            if grep -RFq --include='*.txt' --include='*.log' LAGRANGE_3DS_FIRST_FRAME "$XDG_DATA_HOME" "$OUT/azahar-console.log"; then
+            startup="$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/cache/startup.log"
+            proof="$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/cache/first-frame.ok"
+            if test -f "$startup" && grep -q LAGRANGE_3DS_TLS_FAILED "$startup"; then
+              echo "::error::Guest TLS initialization failed; see guest-startup.log"
+              exit 1
+            fi
+            if test -f "$proof" && grep -q LAGRANGE_3DS_FIRST_FRAME "$proof" &&
+               test -f "$startup" && grep -q LAGRANGE_3DS_TLS_CONTEXT_OK "$startup" &&
+               grep -q LAGRANGE_3DS_CIPHERS_OK "$startup"; then
               sleep 3
               kill -0 "$pid"
               test -d "$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/downloads"
