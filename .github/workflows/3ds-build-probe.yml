@@ -43,6 +43,7 @@ jobs:
           git clone --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL.git /tmp/SDL3
           test "$(git -C /tmp/SDL3 rev-parse HEAD)" = f00dc919ca35b9756316e86c4777392de442f9b2
           python3 port/3ds/handheld-ui.py sdl /tmp/SDL3
+          python3 port/3ds/runtime.py sdl /tmp/SDL3
           git -C /tmp/SDL3 diff > port-report/sdl3-dualscreen.patch
           cmake -S /tmp/SDL3 -B /tmp/sdl-build \
             -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
@@ -738,6 +739,7 @@ jobs:
           p.write_text(s)
           PY
             python3 port/3ds/handheld-ui.py app .
+            python3 port/3ds/runtime.py app .
             git diff -- app > port-report/lagrange-handheld-ui.patch
             # Add static transitive dependencies explicitly, without rewriting
             # desktop library names or adding unresolved host libraries.
