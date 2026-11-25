@@ -895,10 +895,24 @@ jobs:
           retention-days: 14
 
   emulator-launch:
-    name: Experimental Azahar first-frame smoke test
+    name: Azahar ${{ matrix.version }} browser and keyboard acceptance
     needs: probe
     runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Keep the current release for regression evidence.
+          - version: '2127.0.1'
+            sha256: '496501b49b6b90b474047bb70de218e704e3681e42884e015be40001efb99442'
+          # Last 2125 stable release: GSP RestoreVramSysArea completes
+          # synchronously, before the newer indefinitely waiting VBlank path.
+          - version: '2125.1.3'
+            sha256: '906bc0c28c275d5c1cccd339f25ed6040bf0c106f8bec68aed638ebef6338a75'
+    env:
+      AZAHAR_VERSION: ${{ matrix.version }}
+      AZAHAR_SHA256: ${{ matrix.sha256 }}
     steps:
       - name: Check out matching test harness
         uses: actions/checkout@v4
@@ -944,8 +958,10 @@ jobs:
           pause_when_in_background\default=false
           INI
           cd "$RUNNER_TEMP"
-          curl --fail --location --retry 3 -o azahar.AppImage https://github.com/azahar-emu/azahar/releases/download/2127.0.1/azahar.AppImage
-          echo '496501b49b6b90b474047bb70de218e704e3681e42884e015be40001efb99442  azahar.AppImage' | sha256sum -c
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
+            -o azahar.AppImage "https://github.com/azahar-emu/azahar/releases/download/$AZAHAR_VERSION/azahar.AppImage"
+          printf '%s  azahar.AppImage\n' "$AZAHAR_SHA256" | sha256sum -c
+          printf '%s\n' "$AZAHAR_VERSION" > "$OUT/emulator-version.txt"
           chmod +x azahar.AppImage
           ./azahar.AppImage --appimage-extract > "$OUT/appimage-extract.log"
           export EMULATOR="$PWD/squashfs-root/AppRun"
@@ -954,7 +970,14 @@ jobs:
           # Only Azahar and its dependency inspection may see the AppImage libraries.
           # Host Python, OpenSSL, Xvfb and screenshot tools must use system libraries.
           export AZAHAR_LIBRARY_PATH="$PWD/squashfs-root/usr/lib:$PWD/squashfs-root/usr/lib/x86_64-linux-gnu"
-          LD_LIBRARY_PATH="$AZAHAR_LIBRARY_PATH" ldd "$PWD/squashfs-root/AppRun.wrapped" | tee "$OUT/host-library-check.txt"
+          binary="$PWD/squashfs-root/AppRun.wrapped"
+          if ! test -f "$binary"; then
+            for candidate in "$PWD/squashfs-root/usr/bin/azahar" "$PWD/squashfs-root/usr/bin/citra-qt"; do
+              if test -f "$candidate"; then binary="$candidate"; break; fi
+            done
+          fi
+          test -f "$binary"
+          LD_LIBRARY_PATH="$AZAHAR_LIBRARY_PATH" ldd "$binary" | tee "$OUT/host-library-check.txt"
           if grep -q "not found" "$OUT/host-library-check.txt"; then
             echo "::error::Emulator host dependencies unresolved"
             exit 1
@@ -967,7 +990,11 @@ jobs:
           set -euo pipefail
           # Independent comparison; never treat it as a browser acceptance pass.
           mkdir -p "$OUT/keyboard-probe"
-          XDG_DATA_HOME="$XDG_DATA_HOME-probe" \
+          mkdir -p "$XDG_CONFIG_HOME-probe"
+          cp -a "$XDG_CONFIG_HOME/." "$XDG_CONFIG_HOME-probe/"
+          XDG_CONFIG_HOME="$XDG_CONFIG_HOME-probe" \
+            XDG_DATA_HOME="$XDG_DATA_HOME-probe" \
+            XDG_CACHE_HOME="$XDG_CACHE_HOME-probe" \
             OUT="$OUT/keyboard-probe" \
             /usr/bin/python3 "$GITHUB_WORKSPACE/port/3ds/keyboard-probe-host.py" \
             || echo "::warning::Independent keyboard probe did not pass; inspect its evidence"
@@ -1027,7 +1054,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: 3ds-emulator-launch
+          name: 3ds-emulator-launch-${{ matrix.version }}
           path: emulator-report/
           if-no-files-found: warn
           retention-days: 14
