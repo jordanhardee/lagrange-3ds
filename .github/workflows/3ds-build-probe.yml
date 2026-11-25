@@ -419,9 +419,13 @@ jobs:
           set -euo pipefail
           (
             # Keep full pinned source context available in build logs for review.
-            for f in src/address.c src/time.c src/fileinfo.c src/platform/posix/service.c src/platform/posix/pipe.c src/platform/posix/process.c src/platform/posix/socket.c include/the_Foundation/pipe.h include/the_Foundation/process.h; do
+            for f in src/address.c src/time.c src/fileinfo.c src/platform/posix/service.c src/platform/posix/pipe.c src/platform/posix/process.c src/platform/posix/socket.c src/platform/posix/pipe.h include/the_Foundation/process.h src/platform/posix/datagram.c; do
               echo "::group::Pinned Foundation $f"
-              cat "lib/the_Foundation/$f"
+              if [ -f "lib/the_Foundation/$f" ]; then
+                cat "lib/the_Foundation/$f"
+              else
+                echo "Optional diagnostic source unavailable: $f"
+              fi
               echo "::endgroup::"
             done
             python3 - <<'PY'
@@ -553,6 +557,20 @@ jobs:
           old = "listen(d->fd, SOMAXCONN)"
           assert s.count(old) == 1, "unexpected listen backlog"
           p.write_text(s.replace(old, "listen(d->fd, 8)"))
+          # 3DS cannot launch Unix child processes. Follow Foundation's
+          # existing Emscripten approach and explicitly fail start requests.
+          p = root / "src/platform/posix/process.c"
+          s = p.read_text()
+          def replace_process(old, new):
+              global s
+              assert s.count(old) == 1, "unexpected process source: " + old
+              s = s.replace(old, new)
+          replace_process("#if !defined (iPlatformAndroid) && !defined (iPlatformEmscripten)", "#if !defined (iPlatformAndroid) && !defined (iPlatformEmscripten) && !defined (__3DS__)")
+          replace_process("#elif defined (iPlatformEmscripten)\n    /* Browsers cannot start processes. */", "#elif defined (__3DS__)\n    d->exitStatus = -1;\n    errno = ENOSYS;\n    return iFalse;\n#elif defined (iPlatformEmscripten)\n    /* Browsers cannot start processes. */")
+          replace_process("    if (d->pid) {\n        /* Allow zombies to terminate. */\n        int status = 0;\n        waitpid(d->pid, &status, WNOHANG);\n    }", "#ifndef __3DS__\n    if (d->pid) {\n        /* Allow zombies to terminate. */\n        int status = 0;\n        waitpid(d->pid, &status, WNOHANG);\n    }\n#endif")
+          replace_process("    if (!d->pid) return;\n    closeInput_Pipe(&d->pin); /* no more input */", "#ifdef __3DS__\n    iUnused(d);\n#else\n    if (!d->pid) return;\n    closeInput_Pipe(&d->pin); /* no more input */")
+          replace_process("    d->pid = 0;\n}\n\nsize_t writeInput_Process", "    d->pid = 0;\n#endif\n}\n\nsize_t writeInput_Process")
+          p.write_text(s)
           PY
             # Add static transitive dependencies explicitly, without rewriting
             # desktop library names or adding unresolved host libraries.
