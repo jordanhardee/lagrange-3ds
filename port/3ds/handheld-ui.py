@@ -23,8 +23,8 @@ def sdl(root):
         ("    internal->touch_display = AddN3DSDisplay(GFX_BOTTOM);",
          """    internal->touch_display = SDL_GetHintBoolean("LAGRANGE_3DS_DUALSCREEN", false)
         ? internal->top_display : AddN3DSDisplay(GFX_BOTTOM);"""),
-        ("    mode.h = GSP_SCREEN_WIDTH;\n    mode.refresh_rate",
-         """    mode.h = SDL_GetHintBoolean("LAGRANGE_3DS_DUALSCREEN", false) ? 540 : GSP_SCREEN_WIDTH;
+        ("\n    mode.h = GSP_SCREEN_WIDTH;\n    mode.refresh_rate",
+         """\n    mode.h = SDL_GetHintBoolean("LAGRANGE_3DS_DUALSCREEN", false) ? 540 : GSP_SCREEN_WIDTH;
     mode.refresh_rate"""),
         ("        mode.h = GSP_SCREEN_WIDTH;\n        mode.refresh_rate",
          """        mode.h = SDL_GetHintBoolean("LAGRANGE_3DS_DUALSCREEN", false) ? 540 : GSP_SCREEN_WIDTH;
@@ -158,7 +158,7 @@ def app(root):
     showToolbar_Root_(d, iTrue);
     return;
 #endif"""),
-        ('    /* Bars moved elsewhere (e.g., into the phone\\'s bottom bar) are no longer reading bars. */'.replace("\\'", "'"),
+        ("    /* Bars moved elsewhere (e.g., into the phone's bottom bar) are no longer reading bars. */",
          """#ifdef __3DS__
     /* Fixed navigation and toolbar positions are independent of reading mode. */
     order[0] = order[1] = NULL;
