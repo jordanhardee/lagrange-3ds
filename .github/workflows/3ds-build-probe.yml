@@ -143,10 +143,24 @@ jobs:
             export LIBS="-lctru"
             ./configure --host=arm-none-eabi --build="$(build-aux/config.guess)" \
               --prefix="$prefix" --disable-shared --enable-static --with-libiconv-prefix="$prefix"
+            # The generated public stdint.h otherwise redefines uint32_t to
+            # unsigned int even though devkitARM uses unsigned long. Generate
+            # it first, then use the target's own fixed-width integer types.
+            make -C lib unistring/stdint.h
+            printf '#pragma once\n#include <stdint.h>\n' > lib/unistring/stdint.h
             make -C lib -j2
             make -C lib install
             test -s "$prefix/include/unistr.h"
             test -s "$prefix/lib/libunistring.a"
+            # Check that libunistring headers do not change the target ABI.
+            cat > /tmp/lagrange-deps/unistring-types.c <<'EOF'
+          #include <stdint.h>
+          typedef uint32_t native_u32;
+          #include <unistr.h>
+          _Static_assert(__builtin_types_compatible_p(native_u32, uint32_t), "uint32_t redefined");
+          _Static_assert(__builtin_types_compatible_p(native_u32, ucs4_t), "Unicode type mismatch");
+          EOF
+            "$CC" $CFLAGS $CPPFLAGS -c /tmp/lagrange-deps/unistring-types.c -o /tmp/lagrange-deps/unistring-types.o
             arm-none-eabi-objdump -f "$prefix/lib/libunistring.a" > "$GITHUB_WORKSPACE/port-report/unistring-architecture.txt"
           ) 2>&1 | tee port-report/unistring-build.log
 
@@ -398,8 +412,134 @@ jobs:
             sha256sum port-report/*.3dsx > port-report/SHA256SUMS
           ) 2>&1 | tee port-report/openssl-link.log
 
-      - name: Probe unmodified Lagrange configuration
+      - name: Adapt pinned Foundation sources to devkitARM
+        id: foundation_patch
         if: ${{ !cancelled() && steps.unistring.outcome == 'success' && steps.pcre2.outcome == 'success' && steps.openssl.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          (
+            # Keep full pinned source context available in build logs for review.
+            for f in src/address.c src/time.c src/fileinfo.c src/platform/posix/service.c; do
+              echo "::group::Pinned Foundation $f"
+              cat "lib/the_Foundation/$f"
+              echo "::endgroup::"
+            done
+            python3 - <<'PY'
+          from pathlib import Path
+          root = Path("lib/the_Foundation")
+          p = root / "src/address.c"
+          s = p.read_text()
+          assert s.count("<ifaddrs.h>") == 1, "unexpected interface discovery include"
+          p.write_text(s.replace("<ifaddrs.h>", '"ifaddrs_3ds.h"'))
+          # No global fake socket definitions: this header is private to address.c.
+          (root / "src/ifaddrs_3ds.h").write_text(r"""#pragma once
+          #include <3ds/types.h>
+          #include <3ds/services/soc.h>
+          #include <errno.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #ifndef IFF_UP
+          #define IFF_UP 0x1
+          #endif
+          #ifndef IFF_BROADCAST
+          #define IFF_BROADCAST 0x2
+          #endif
+          #ifndef IFF_LOOPBACK
+          #define IFF_LOOPBACK 0x8
+          #endif
+          #ifndef IFF_RUNNING
+          #define IFF_RUNNING 0x40
+          #endif
+          #ifndef IFF_MULTICAST
+          #define IFF_MULTICAST 0x1000
+          #endif
+          struct ifaddrs {
+              struct ifaddrs *ifa_next;
+              char *ifa_name;
+              unsigned int ifa_flags;
+              struct sockaddr *ifa_addr, *ifa_netmask, *ifa_broadaddr;
+          };
+          struct ifaddrs_3ds {
+              struct ifaddrs entry;
+              struct sockaddr_in ip, mask, broadcast;
+              char name[5];
+          };
+          static inline int getifaddrs(struct ifaddrs **out)
+          {
+              struct in_addr ip, mask, broadcast;
+              struct ifaddrs_3ds *p;
+              *out = NULL;
+              if (SOCU_GetIPInfo(&ip, &mask, &broadcast) != 0) {
+                  errno = ENETDOWN;
+                  return -1;
+              }
+              if (ip.s_addr == 0)
+                  return 0;
+              p = calloc(1, sizeof(*p));
+              if (!p)
+                  return -1;
+              memcpy(p->name, "wlan", 5);
+              p->ip.sin_family = p->mask.sin_family = p->broadcast.sin_family = AF_INET;
+              p->ip.sin_addr = ip;
+              p->mask.sin_addr = mask;
+              p->broadcast.sin_addr = broadcast;
+              p->entry.ifa_name = p->name;
+              p->entry.ifa_flags = IFF_UP | IFF_RUNNING | IFF_BROADCAST;
+              p->entry.ifa_addr = (struct sockaddr *)&p->ip;
+              p->entry.ifa_netmask = (struct sockaddr *)&p->mask;
+              p->entry.ifa_broadaddr = (struct sockaddr *)&p->broadcast;
+              *out = &p->entry;
+              return 0;
+          }
+          static inline void freeifaddrs(struct ifaddrs *p)
+          {
+              free(p);
+          }
+          """)
+          p = root / "src/fileinfo.c"
+          s = p.read_text()
+          assert s.count("st.st_mtimespec") == 2, "unexpected file timestamp code"
+          # This is a 3DS-only build-time patch. Newlib uses st_mtim.
+          p.write_text(s.replace("st.st_mtimespec", "st.st_mtim"))
+          p = root / "src/time.c"
+          s = p.read_text()
+          old = "tm->tm_gmtoff = date->gmtOffsetSeconds;"
+          assert s.count(old) == 1, "unexpected tm offset assignment"
+          s = s.replace(old, "/* newlib struct tm cannot store a UTC offset. */\n    (void)date->gmtOffsetSeconds;")
+          old = "d->gmtOffsetSeconds = t->tm_gmtoff;"
+          assert s.count(old) == 1, "unexpected tm offset extraction"
+          # Use libc's local time offset formatting rather than a fake member.
+          # tm_isdst is provided by the caller. Explicit offset round-trips
+          # and local-time behavior remain a hardware validation item.
+          s = s.replace(old, """{
+                  char zone[16] = {0};
+                  int hours = 0, minutes = 0;
+                  d->gmtOffsetSeconds = 0;
+                  if (strftime(zone, sizeof(zone), "%z", t) == 5 &&
+                      (zone[0] == '+' || zone[0] == '-') &&
+                      zone[1] >= '0' && zone[1] <= '9' &&
+                      zone[2] >= '0' && zone[2] <= '9' &&
+                      zone[3] >= '0' && zone[3] <= '9' &&
+                      zone[4] >= '0' && zone[4] <= '9') {
+                      hours = (zone[1] - '0') * 10 + zone[2] - '0';
+                      minutes = (zone[3] - '0') * 10 + zone[4] - '0';
+                      d->gmtOffsetSeconds = (zone[0] == '-' ? -1 : 1) *
+                                            (hours * 3600 + minutes * 60);
+                  }
+              }""")
+          p.write_text(s)
+          p = root / "src/platform/posix/service.c"
+          s = p.read_text()
+          old = "listen(d->fd, SOMAXCONN)"
+          assert s.count(old) == 1, "unexpected listen backlog"
+          p.write_text(s.replace(old, "listen(d->fd, 8)"))
+          PY
+            git -C lib/the_Foundation diff > port-report/foundation-3ds.patch
+            cp lib/the_Foundation/src/ifaddrs_3ds.h port-report/
+          ) 2>&1 | tee port-report/foundation-patch.log
+
+      - name: Build Lagrange with Foundation platform adaptations
+        if: ${{ !cancelled() && steps.foundation_patch.outcome == 'success' }}
         run: |
           set -euo pipefail
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/3ds/bin:$PATH"
