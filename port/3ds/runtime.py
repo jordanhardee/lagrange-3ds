@@ -265,6 +265,7 @@ enum iMouseWheelFlag {"""),
 #ifdef __3DS__
 #include <3ds/applets/swkbd.h>
 #include <3ds/svc.h>
+#include <SDL3/SDL_hints.h>
 #include <string.h>
 
 /* The keyboard is modal and may suspend the application. Only one launch
