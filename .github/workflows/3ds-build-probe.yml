@@ -216,6 +216,32 @@ jobs:
           assert s.count(old) == 1, "unexpected OpenSSL lookup fallback ending"
           p.write_text(s.replace(old, new))
           PY
+            # libctru has no SO_KEEPALIVE. Do not request it by default,
+            # and report failure if a caller explicitly asks for it.
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crypto/bio/bio_sock2.c")
+          s = p.read_text()
+          old = "\n".join(["    if (options & BIO_SOCK_KEEPALIVE) {",
+                           "        if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,",
+                           "                (const void *)&on, sizeof(on))",
+                           "            != 0) {",
+                           "            ERR_raise_data(ERR_LIB_SYS, get_last_socket_error(),",
+                           '                "calling setsockopt()");',
+                           "            ERR_raise(ERR_LIB_BIO, BIO_R_UNABLE_TO_KEEPALIVE);",
+                           "            return 0;",
+                           "        }",
+                           "    }"])
+          new = old.replace("        if (setsockopt", "#ifdef SO_KEEPALIVE\n        if (setsockopt", 1)
+          new = new[:-5] + "#else\n        ERR_raise(ERR_LIB_BIO, BIO_R_UNABLE_TO_KEEPALIVE);\n        return 0;\n#endif\n    }"
+          assert s.count(old) == 2, "unexpected OpenSSL keepalive blocks"
+          p.write_text(s.replace(old, new))
+          p = Path("crypto/bio/bss_conn.c")
+          s = p.read_text()
+          old = "            if (BIO_ADDRINFO_socktype(c->addr_iter) == SOCK_STREAM)\n                opts |= BIO_SOCK_KEEPALIVE;"
+          assert s.count(old) == 1, "unexpected OpenSSL default keepalive"
+          p.write_text(s.replace(old, "#ifdef SO_KEEPALIVE\n" + old + "\n#endif"))
+          PY
             # Generic ARM/newlib target, not a Linux target. Keep thread safety
             # and OS entropy enabled; runtime entropy and TLS need hardware validation.
             cat > Configurations/99-nintendo-3ds.conf <<'EOF'
