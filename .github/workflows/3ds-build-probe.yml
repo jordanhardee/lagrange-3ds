@@ -120,6 +120,17 @@ jobs:
             echo '5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c  libunistring-1.4.2.tar.xz' | sha256sum -c -
             tar -xf libunistring-1.4.2.tar.xz
             cd libunistring-1.4.2
+            # Newlib exposes locale names through nl_langinfo_l, like musl.
+            # Only enable this branch if the target headers provide NL_LOCALE_NAME.
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("lib/getlocalename_l-unsafe.c")
+          s = p.read_text()
+          old = "#elif defined __linux__ && HAVE_LANGINFO_H && defined NL_LOCALE_NAME"
+          new = "#elif (defined __linux__ || defined __3DS__) && HAVE_LANGINFO_H && defined NL_LOCALE_NAME"
+          assert s.count(old) == 1, "unexpected libunistring locale source"
+          p.write_text(s.replace(old, new))
+          PY
             export CC=arm-none-eabi-gcc AR=arm-none-eabi-ar RANLIB=arm-none-eabi-ranlib
             export CFLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -mword-relocations -O2 -ffunction-sections -fdata-sections"
             export CPPFLAGS="-D__3DS__ -I$prefix/include -I$DEVKITPRO/libctru/include"
@@ -147,6 +158,17 @@ jobs:
             curl --fail --location --retry 3 https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz -o pcre2-10.49.tar.gz
             echo '929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae  pcre2-10.49.tar.gz' | sha256sum -c -
             tar -xf pcre2-10.49.tar.gz
+            # read_number takes int*, but newlib int32_t is long.
+            # Match the local variables to the helper signature, not a pointer cast.
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("pcre2-10.49/src/pcre2_compile.c")
+          s = p.read_text()
+          old = "int32_t min = 0;\nint32_t max = REPEAT_UNLIMITED;"
+          new = "int min = 0;\nint max = REPEAT_UNLIMITED;"
+          assert s.count(old) == 1, "unexpected PCRE2 quantifier source"
+          p.write_text(s.replace(old, new))
+          PY
             cmake -S pcre2-10.49 -B pcre2-build \
               -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
               -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
@@ -188,7 +210,7 @@ jobs:
             CC=arm-none-eabi-gcc AR=arm-none-eabi-ar RANLIB=arm-none-eabi-ranlib \
               perl Configure nintendo-3ds --prefix="$prefix" --libdir=lib \
                 --openssldir=sdmc:/3ds/lagrange/openssl \
-                -D__3DS__ -I"$DEVKITPRO/libctru/include" -I"$prefix/include" \
+                -D__3DS__ -DOPENSSL_USE_IPV6=0 -DOPENSSL_NO_UNIX_SOCK -I"$DEVKITPRO/libctru/include" -I"$prefix/include" \
                 no-shared no-dso no-module no-asm no-async no-engine no-tests no-apps \
                 no-thread-pool --with-rand-seed=os
             make -j2 build_libs
