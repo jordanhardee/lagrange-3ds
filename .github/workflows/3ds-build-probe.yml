@@ -1,0 +1,128 @@
+name: Nintendo 3DS port - build probe
+
+on:
+  push:
+    branches: [3ds-dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:20260610
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITARM: /opt/devkitpro/devkitARM
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect ARM toolchain and available portlibs
+        run: |
+          set -euo pipefail
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/3ds/bin:$PATH"
+          arm-none-eabi-gcc --version
+          cmake --version
+          test -f "$DEVKITPRO/cmake/3DS.cmake"
+          mkdir -p port-report
+          dkp-pacman -Q > port-report/installed-packages.txt
+          dkp-pacman -Sl > port-report/available-packages.txt
+          grep -Ei 'openssl|unistring|pcre|sdl|zlib|freetype|harfbuzz|fribidi' port-report/available-packages.txt || true
+          git submodule sync --recursive
+          git submodule update --init lib/the_Foundation
+
+      - name: Build SDL3 for ARM (pinned upstream revision)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL.git /tmp/SDL3
+          test "$(git -C /tmp/SDL3 rev-parse HEAD)" = f00dc919ca35b9756316e86c4777392de442f9b2
+          cmake -S /tmp/SDL3 -B /tmp/sdl-build \
+            -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
+            -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=OFF -DSDL_STATIC=ON \
+            -DSDL_TESTS=OFF -DSDL_DISABLE_INSTALL=OFF -DSDL_DISABLE_INSTALL_CPACK=OFF \
+            -DCMAKE_INSTALL_PREFIX="$DEVKITPRO/portlibs/3ds"
+          cmake --build /tmp/sdl-build --parallel 2
+          cmake --install /tmp/sdl-build
+
+      - name: Compile and package SDL3 smoke test
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/3ds-smoke
+          cat > /tmp/3ds-smoke/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.15)
+          project(lagrange_3ds_smoke C)
+          find_package(SDL3 CONFIG REQUIRED)
+          add_executable(lagrange-3ds-smoke main.c)
+          target_link_libraries(lagrange-3ds-smoke PRIVATE SDL3::SDL3)
+          ctr_generate_smdh(OUTPUT smoke.smdh NAME "Lagrange 3DS Smoke Test"
+            DESCRIPTION "SDL3 build verification; not a browser" AUTHOR "Lagrange 3DS project")
+          ctr_create_3dsx(lagrange-3ds-smoke SMDH smoke.smdh)
+          EOF
+          cat > /tmp/3ds-smoke/main.c <<'EOF'
+          #include <SDL3/SDL.h>
+          #include <SDL3/SDL_main.h>
+          #include <3ds.h>
+          int main(int argc, char **argv) {
+              (void) argc; (void) argv;
+              if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
+              SDL_Window *window = SDL_CreateWindow("Lagrange 3DS smoke test", 400, 240, 0);
+              if (!window) { SDL_Quit(); return 2; }
+              SDL_Renderer *renderer = SDL_CreateRenderer(window, "software");
+              if (!renderer) { SDL_DestroyWindow(window); SDL_Quit(); return 3; }
+              while (aptMainLoop()) {
+                  SDL_Event event;
+                  while (SDL_PollEvent(&event)) {
+                      if (event.type == SDL_EVENT_QUIT) goto done;
+                  }
+                  hidScanInput();
+                  if (hidKeysDown() & KEY_START) break;
+                  SDL_SetRenderDrawColor(renderer, 40, 65, 48, 255);
+                  SDL_RenderClear(renderer);
+                  SDL_SetRenderDrawColor(renderer, 235, 223, 193, 255);
+                  SDL_FRect paper = { 20, 20, 360, 200 };
+                  SDL_RenderFillRect(renderer, &paper);
+                  SDL_RenderPresent(renderer);
+                  SDL_Delay(16);
+              }
+          done:
+              SDL_DestroyRenderer(renderer);
+              SDL_DestroyWindow(window);
+              SDL_Quit();
+              return 0;
+          }
+          EOF
+          cmake -S /tmp/3ds-smoke -B /tmp/smoke-build \
+            -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/smoke-build --parallel 2
+          test -s /tmp/smoke-build/lagrange-3ds-smoke.3dsx
+          cp /tmp/smoke-build/lagrange-3ds-smoke.3dsx port-report/
+          sha256sum port-report/*.3dsx > port-report/SHA256SUMS
+
+      - name: Probe unmodified Lagrange configuration
+        run: |
+          set -euo pipefail
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/3ds/bin:$PATH"
+          export PKG_CONFIG_PATH=
+          export PKG_CONFIG_LIBDIR="$DEVKITPRO/portlibs/3ds/lib/pkgconfig:$DEVKITPRO/portlibs/armv6k/lib/pkgconfig"
+          cmake -S . -B /tmp/lagrange-3ds-build \
+            -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC=ON \
+            -DENABLE_GUI=ON -DENABLE_TUI=OFF -DINSTALL_GMGET=OFF \
+            -DENABLE_X11_XLIB=OFF -DENABLE_HARFBUZZ=OFF \
+            2>&1 | tee port-report/lagrange-configure.log
+          cmake --build /tmp/lagrange-3ds-build --parallel 2 \
+            2>&1 | tee port-report/lagrange-build.log
+
+      - name: Upload diagnostics and smoke-test binary if available
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3ds-port-probe
+          path: port-report/
+          if-no-files-found: warn
+          retention-days: 14
