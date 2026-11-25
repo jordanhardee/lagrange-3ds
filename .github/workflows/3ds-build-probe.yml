@@ -419,7 +419,7 @@ jobs:
           set -euo pipefail
           (
             # Keep full pinned source context available in build logs for review.
-            for f in src/address.c src/time.c src/fileinfo.c src/platform/posix/service.c; do
+            for f in src/address.c src/time.c src/fileinfo.c src/platform/posix/service.c src/platform/posix/pipe.c src/platform/posix/process.c src/platform/posix/socket.c include/the_Foundation/pipe.h include/the_Foundation/process.h; do
               echo "::group::Pinned Foundation $f"
               cat "lib/the_Foundation/$f"
               echo "::endgroup::"
@@ -554,6 +554,23 @@ jobs:
           assert s.count(old) == 1, "unexpected listen backlog"
           p.write_text(s.replace(old, "listen(d->fd, 8)"))
           PY
+            # Add static transitive dependencies explicitly, without rewriting
+            # desktop library names or adding unresolved host libraries.
+            cat >> CMakeLists.txt <<'EOF'
+
+          # Nintendo 3DS build-only linkage additions.
+          find_library(N3DS_ICONV NAMES iconv REQUIRED)
+          set_property(TARGET the_Foundation APPEND PROPERTY INTERFACE_LINK_LIBRARIES "${N3DS_ICONV}")
+          if(TARGET app)
+              find_package(PNG REQUIRED)
+              find_package(BZip2 REQUIRED)
+              target_link_libraries(app PUBLIC PNG::PNG BZip2::BZip2)
+          endif()
+          EOF
+            echo "::group::Foundation process and pipe consumers"
+            git grep -n -E '(_Process|_Pipe)\(' -- app lib/core || true
+            grep -R -n -E '(_Process|_Pipe)\(' lib/the_Foundation/src || true
+            echo "::endgroup::"
             git -C lib/the_Foundation diff > port-report/foundation-3ds.patch
             cp lib/the_Foundation/src/ifaddrs_3ds.h port-report/
           ) 2>&1 | tee port-report/foundation-patch.log
@@ -570,6 +587,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC=OFF \
             -DENABLE_GUI=ON -DENABLE_TUI=OFF -DINSTALL_GMGET=OFF \
             -DENABLE_X11_XLIB=OFF -DENABLE_HARFBUZZ=OFF \
+            -DENABLE_IPC=OFF -DENABLE_DOWNLOAD_EDIT=OFF -DENABLE_FILE_REVEAL=OFF \
             -DUNISTRING_DIR="$DEVKITPRO/portlibs/3ds" \
             2>&1 | tee port-report/lagrange-configure.log
           # The toolchain and target portlibs already supply static archives.
