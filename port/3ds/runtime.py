@@ -38,6 +38,21 @@ def sdl(root):
          """    SDL_MOUSEWHEEL_FLIPPED,   /**< The scroll direction is flipped / natural */
     SDL_MOUSEWHEEL_N3DS_PRIVATE_FLAGS = 0x7fffffff /* keep enum 32 bits */"""),
     ])
+    # A touch used to dismiss the system applet must not become a fresh
+    # browser tap on resume. Preserve the release boundary in SDL's driver.
+    edit(root / "src/video/n3ds/SDL_n3dstouch.c", [
+        ("    if (pressed != was_pressed) {",
+         """    if (SDL_GetHintBoolean("LAGRANGE_3DS_TOUCH_REARM", false)) {
+        if (was_pressed) {
+            SDL_SendTouch(0, N3DS_TOUCH_ID, N3DS_TOUCH_FINGER, window,
+                          SDL_EVENT_FINGER_CANCELED, last_x, last_y, 0.0f);
+            was_pressed = false;
+        }
+        if (!pressed) SDL_SetHint("LAGRANGE_3DS_TOUCH_REARM", "0");
+        return;
+    }
+    if (pressed != was_pressed) {"""),
+    ])
     # Do not invoke a blocking native applet from SDL_StartTextInput.
     # Lagrange explicitly invokes it after preparing the input widget.
     edit(root / "src/video/n3ds/SDL_n3dsswkb.c", [
@@ -249,48 +264,87 @@ enum iMouseWheelFlag {"""),
          """#include "input/impl.h"
 #ifdef __3DS__
 #include <3ds/applets/swkbd.h>
+#include <3ds/svc.h>
 #include <string.h>
+
+/* The keyboard is modal and may suspend the application. Only one launch
+   may be outstanding; ignore stale focus notifications just after return. */
+static iBool nativeKeyboardActive_3ds_;
+static uint64_t nativeKeyboardClosed_3ds_;
+static void keyboardTrace_3ds_(const char *message) {
+    svcOutputDebugString(message, strlen(message));
+}
 #endif"""),
+        ("    if (isCommand_Widget(w, ev, \"focus.gained\")) {",
+         """#ifdef __3DS__
+    /* Run the modal applet as a separate command after normal focus
+       dispatch has completed. A stale request cannot reopen the applet. */
+    if (isCommand_Widget(w, ev, "n3ds.keyboard.open")) {
+        if (!isFocused_Widget(w) || !isEditing_InputWidget_(d) ||
+            nativeKeyboardActive_3ds_) return iTrue;
+        const iString *initial = text_InputWidget(d);
+        const int maxChars = d->maxLen > 0 && d->maxLen < 1024 ? d->maxLen : 1024;
+        if (size_String(initial) >= 1024) return iTrue;
+        SwkbdState keyboard;
+        char result[4096] = {0};
+        swkbdInit(&keyboard, SWKBD_TYPE_NORMAL, 2, maxChars);
+        swkbdSetInitialText(&keyboard, cstr_String(initial));
+        swkbdSetButton(&keyboard, SWKBD_BUTTON_LEFT, "Cancel", false);
+        swkbdSetButton(&keyboard, SWKBD_BUTTON_CONFIRM, "OK", true);
+        nativeKeyboardActive_3ds_ = iTrue;
+        keyboardTrace_3ds_("LAGRANGE_3DS_SWKBD_OPEN");
+        const SwkbdButton button = swkbdInputText(&keyboard, result, sizeof(result));
+        nativeKeyboardClosed_3ds_ = SDL_GetTicks();
+        SDL_SetHint("LAGRANGE_3DS_TOUCH_REARM", "1");
+        char marker[96];
+        snprintf(marker, sizeof(marker), "LAGRANGE_3DS_SWKBD_RETURN button:%d result:%d",
+                 (int) button, (int) keyboard.result);
+        keyboardTrace_3ds_(marker);
+        if (button == SWKBD_BUTTON_CONFIRM) {
+            setTextUndoableCStr_InputWidget(d, result, iTrue);
+            contentsWereChanged_InputWidget_(d);
+            if ((d->inFlags & isUrl_InputWidgetFlag) &&
+                !cmp_String(id_Widget(w), "url"))
+                d->inFlags |= enterPressed_InputWidgetFlag;
+            end_InputWidget(d, iTrue);
+            keyboardTrace_3ds_("LAGRANGE_3DS_SWKBD_CONFIRM");
+        }
+        else if (button == SWKBD_BUTTON_LEFT) {
+            end_InputWidget(d, iFalse);
+            keyboardTrace_3ds_("LAGRANGE_3DS_SWKBD_CANCEL");
+        }
+        memset(result, 0, sizeof(result));
+        /* An applet error leaves the themed editor usable. Never treat
+           an invalid return code as confirmation or as new input. */
+        if (button == SWKBD_BUTTON_CONFIRM || button == SWKBD_BUTTON_LEFT) {
+            if (isFocused_Widget(w)) setFocus_Widget(NULL);
+        }
+        nativeKeyboardActive_3ds_ = iFalse;
+        postRefresh_Window(window_Widget(w));
+        keyboardTrace_3ds_("LAGRANGE_3DS_SWKBD_RESUME");
+        return iTrue;
+    }
+#endif
+    if (isCommand_Widget(w, ev, "focus.gained")) {"""),
         ("            begin_InputWidget_(d, method != arrowKeys_FocusMethod);",
          """#ifdef __3DS__
+            if (!isFocused_Widget(w)) return iFalse;
             const iBool alreadyEditing = isEditing_InputWidget_(d);
+            const iBool useNative = !alreadyEditing &&
+                method != arrowKeys_FocusMethod &&
+                !isAllowedToInsertNewline_InputWidget_(d) &&
+                !(d->inFlags & isSensitive_InputWidgetFlag) &&
+                size_String(text_InputWidget(d)) < 1024;
+            if (useNative && (nativeKeyboardActive_3ds_ ||
+                (nativeKeyboardClosed_3ds_ &&
+                 SDL_GetTicks() - nativeKeyboardClosed_3ds_ < 350))) {
+                setFocus_Widget(NULL);
+                return iFalse;
+            }
 #endif
             begin_InputWidget_(d, method != arrowKeys_FocusMethod);
 #ifdef __3DS__
-            /* Single-line ordinary inputs use the system keyboard. Keep the
-               themed editor for PEMs, uploads, sensitive input and long text. */
-            if (!alreadyEditing && method != arrowKeys_FocusMethod &&
-                !isAllowedToInsertNewline_InputWidget_(d) &&
-                !(d->inFlags & isSensitive_InputWidgetFlag)) {
-                const iString *initial = text_InputWidget(d);
-                const int maxChars = d->maxLen > 0 && d->maxLen < 1024 ? d->maxLen : 1024;
-                if (size_String(initial) < 1024) {
-                    SwkbdState keyboard;
-                    char result[4096] = {0};
-                    swkbdInit(&keyboard, SWKBD_TYPE_NORMAL, 2, maxChars);
-                    swkbdSetInitialText(&keyboard, cstr_String(initial));
-                    const SwkbdButton button = swkbdInputText(&keyboard, result, sizeof(result));
-                    if (button == SWKBD_BUTTON_CONFIRM) {
-                        setTextUndoableCStr_InputWidget(d, result, iTrue);
-                        contentsWereChanged_InputWidget_(d);
-                        /* Submit the address field; other fields retain the
-                           normal dialog-level confirmation controls. */
-                        if ((d->inFlags & isUrl_InputWidgetFlag) &&
-                            !cmp_String(id_Widget(w), "url"))
-                            d->inFlags |= enterPressed_InputWidgetFlag;
-                        end_InputWidget(d, iTrue);
-                    }
-                    else if (button == SWKBD_BUTTON_LEFT) {
-                        end_InputWidget(d, iFalse);
-                    }
-                    memset(result, 0, sizeof(result));
-                    /* Applet errors (including an emulator without keyboard support)
-                       must leave the existing themed editor available. */
-                    if (button == SWKBD_BUTTON_CONFIRM || button == SWKBD_BUTTON_LEFT)
-                        setFocus_Widget(NULL);
-                    postRefresh_Window(window_Widget(w));
-                }
-            }
+            if (useNative) postCommand_Widget(w, "n3ds.keyboard.open");
 #endif"""),
     ])
 

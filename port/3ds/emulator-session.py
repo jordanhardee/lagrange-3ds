@@ -217,8 +217,22 @@ def finish_keyboard(box, top, main_window, submit, address=""):
     print(line, flush=True)
     if expected not in line:
         raise AssertionError(f"Unexpected software keyboard result: {line}; expected {expected}")
-    # Wait for the applet to return, then make sure a duplicate did not open.
+    # Host dialog completion is not proof the guest returned from libctru.
+    # Require the corresponding guest result and resume before proceeding.
+    path = Path(os.environ["XDG_DATA_HOME"]) / "azahar-emu" / "log" / "azahar_log.txt"
+    expected_guest = "LAGRANGE_3DS_SWKBD_CONFIRM" if submit else "LAGRANGE_3DS_SWKBD_CANCEL"
+    expected_launches = 2 if submit else 1
+    def guest_resumed():
+        try:
+            log = path.read_text(errors="replace")
+            return (expected_guest in log and
+                    log.count("LAGRANGE_3DS_SWKBD_RESUME") >= expected_launches)
+        except OSError:
+            return False
+    wait_for(guest_resumed, "Guest did not complete native keyboard return/resume", 15)
     time.sleep(1)
+    if path.read_text(errors="replace").count("LAGRANGE_3DS_SWKBD_OPEN") != expected_launches:
+        raise AssertionError("Guest opened an unexpected extra software keyboard")
     wait_for(lambda: keyboard_box(screenshot("keyboard-after-submit" if submit else "keyboard-after-cancel"), top) is None,
              "Software keyboard remained visible or reopened after button click", 12)
     run("xdotool", "windowfocus", main_window)
