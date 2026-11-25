@@ -883,16 +883,21 @@ jobs:
           export EMULATOR="$PWD/squashfs-root/AppRun"
           # Resolve AppImage libraries before starting the guest. The previous
           # failure was a missing host libOpenGL.so.0, not a guest crash.
-          export LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib:$PWD/squashfs-root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          ldd "$PWD/squashfs-root/AppRun.wrapped" | tee "$OUT/host-library-check.txt"
+          # Only Azahar and its dependency inspection may see the AppImage libraries.
+          # Host Python, OpenSSL, Xvfb and screenshot tools must use system libraries.
+          export AZAHAR_LIBRARY_PATH="$PWD/squashfs-root/usr/lib:$PWD/squashfs-root/usr/lib/x86_64-linux-gnu"
+          LD_LIBRARY_PATH="$AZAHAR_LIBRARY_PATH" ldd "$PWD/squashfs-root/AppRun.wrapped" | tee "$OUT/host-library-check.txt"
           if grep -q "not found" "$OUT/host-library-check.txt"; then
             echo "::error::Emulator host dependencies unresolved"
             exit 1
           fi
-          export LIBGL_ALWAYS_SOFTWARE=1 QT_QPA_PLATFORM=xcb
+          # Check that the fixture uses Ubuntu OpenSSL and the apt-installed Pillow.
+          unset LD_LIBRARY_PATH LD_PRELOAD OPENSSL_CONF OPENSSL_MODULES
+          /usr/bin/openssl version | tee "$OUT/fixture-openssl-version.txt"
+          /usr/bin/python3 -c 'import ssl, PIL; print(ssl.OPENSSL_VERSION); print("Pillow", PIL.__version__)' | tee "$OUT/fixture-python-version.txt"
           xvfb-run -a -s '-screen 0 1280x1024x24' bash <<'SCRIPT'
           set -euo pipefail
-          "$EMULATOR" "$ROM" > "$OUT/azahar-console.log" 2>&1 &
+          env LD_LIBRARY_PATH="$AZAHAR_LIBRARY_PATH" LIBGL_ALWAYS_SOFTWARE=1 QT_QPA_PLATFORM=xcb "$EMULATOR" "$ROM" > "$OUT/azahar-console.log" 2>&1 &
           pid=$!
           cleanup() {
             timeout 5s import -window root "$OUT/screenshot.png" 2>/dev/null || true
@@ -936,7 +941,7 @@ jobs:
               test -d "$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/downloads"
               test -d "$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/cache"
               echo 'Guest reached dual-screen framebuffer update and created virtual SD storage.' | tee "$OUT/result.txt"
-              python3 "$GITHUB_WORKSPACE/port/3ds/emulator-session.py" "$pid"
+              /usr/bin/python3 "$GITHUB_WORKSPACE/port/3ds/emulator-session.py" "$pid"
               exit 0
             fi
             sleep 1
