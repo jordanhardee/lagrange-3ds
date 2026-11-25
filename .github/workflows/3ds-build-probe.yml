@@ -12,7 +12,7 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     container: devkitpro/devkitarm:20260610
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -51,6 +51,7 @@ jobs:
           cmake --install /tmp/sdl-build
 
       - name: Compile and package SDL3 smoke test
+        id: smoke
         run: |
           set -euo pipefail
           mkdir -p /tmp/3ds-smoke
@@ -105,6 +106,97 @@ jobs:
           cp /tmp/smoke-build/lagrange-3ds-smoke.3dsx port-report/
           sha256sum port-report/*.3dsx > port-report/SHA256SUMS
 
+      - name: Cross-compile GNU libunistring
+        id: unistring
+        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          (
+            export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/3ds/bin:$PATH"
+            prefix="$DEVKITPRO/portlibs/3ds"
+            mkdir -p /tmp/lagrange-deps
+            cd /tmp/lagrange-deps
+            curl --fail --location --retry 3 https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.xz -o libunistring-1.4.2.tar.xz
+            echo '5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c  libunistring-1.4.2.tar.xz' | sha256sum -c -
+            tar -xf libunistring-1.4.2.tar.xz
+            cd libunistring-1.4.2
+            export CC=arm-none-eabi-gcc AR=arm-none-eabi-ar RANLIB=arm-none-eabi-ranlib
+            export CFLAGS="-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -mword-relocations -O2 -ffunction-sections -fdata-sections"
+            export CPPFLAGS="-D__3DS__ -I$prefix/include -I$DEVKITPRO/libctru/include"
+            export LDFLAGS="$CFLAGS -specs=3dsx.specs -L$prefix/lib -L$DEVKITPRO/libctru/lib"
+            export LIBS="-lctru"
+            ./configure --host=arm-none-eabi --build="$(build-aux/config.guess)" \
+              --prefix="$prefix" --disable-shared --enable-static --with-libiconv-prefix="$prefix"
+            make -C lib -j2
+            make -C lib install
+            test -s "$prefix/include/unistr.h"
+            test -s "$prefix/lib/libunistring.a"
+            arm-none-eabi-objdump -f "$prefix/lib/libunistring.a" > "$GITHUB_WORKSPACE/port-report/unistring-architecture.txt"
+          ) 2>&1 | tee port-report/unistring-build.log
+
+      - name: Cross-compile PCRE2
+        id: pcre2
+        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          (
+            export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/3ds/bin:$PATH"
+            prefix="$DEVKITPRO/portlibs/3ds"
+            mkdir -p /tmp/lagrange-deps
+            cd /tmp/lagrange-deps
+            curl --fail --location --retry 3 https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz -o pcre2-10.49.tar.gz
+            echo '929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae  pcre2-10.49.tar.gz' | sha256sum -c -
+            tar -xf pcre2-10.49.tar.gz
+            cmake -S pcre2-10.49 -B pcre2-build \
+              -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+              -DBUILD_SHARED_LIBS=OFF -DPCRE2_BUILD_PCRE2_8=ON \
+              -DPCRE2_BUILD_PCRE2_16=OFF -DPCRE2_BUILD_PCRE2_32=OFF \
+              -DPCRE2_SUPPORT_UNICODE=ON -DPCRE2_SUPPORT_JIT=OFF \
+              -DPCRE2_BUILD_PCRE2GREP=OFF -DPCRE2_BUILD_TESTS=OFF
+            cmake --build pcre2-build --parallel 2
+            cmake --install pcre2-build
+            "$prefix/bin/arm-none-eabi-pkg-config" --modversion libpcre2-8
+            arm-none-eabi-objdump -f "$prefix/lib/libpcre2-8.a" > "$GITHUB_WORKSPACE/port-report/pcre2-architecture.txt"
+          ) 2>&1 | tee port-report/pcre2-build.log
+
+      - name: Cross-compile OpenSSL 3.5 LTS
+        id: openssl
+        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          (
+            export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/3ds/bin:$PATH"
+            prefix="$DEVKITPRO/portlibs/3ds"
+            mkdir -p /tmp/lagrange-deps
+            cd /tmp/lagrange-deps
+            curl --fail --location --retry 3 https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz -o openssl-3.5.9.tar.gz
+            echo '603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  openssl-3.5.9.tar.gz' | sha256sum -c -
+            tar -xf openssl-3.5.9.tar.gz
+            cd openssl-3.5.9
+            # Generic ARM/newlib target, not a Linux target. Keep thread safety
+            # and OS entropy enabled; runtime entropy and TLS need hardware validation.
+            cat > Configurations/99-nintendo-3ds.conf <<'EOF'
+          my %targets = (
+              "nintendo-3ds" => {
+                  inherit_from => [ "gcc" ],
+                  thread_scheme => "pthreads",
+                  cflags => "-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -mword-relocations -ffunction-sections -fdata-sections",
+              },
+          );
+          EOF
+            CC=arm-none-eabi-gcc AR=arm-none-eabi-ar RANLIB=arm-none-eabi-ranlib \
+              perl Configure nintendo-3ds --prefix="$prefix" --libdir=lib \
+                --openssldir=sdmc:/3ds/lagrange/openssl \
+                -D__3DS__ -I"$DEVKITPRO/libctru/include" -I"$prefix/include" \
+                no-shared no-dso no-module no-asm no-async no-engine no-tests no-apps \
+                no-thread-pool --with-rand-seed=os
+            make -j2 build_libs
+            make install_dev
+            "$prefix/bin/arm-none-eabi-pkg-config" --modversion openssl
+            arm-none-eabi-objdump -f "$prefix/lib/libcrypto.a" > "$GITHUB_WORKSPACE/port-report/openssl-architecture.txt"
+          ) 2>&1 | tee port-report/openssl-build.log
+
       - name: Probe unmodified Lagrange configuration
         run: |
           set -euo pipefail
@@ -116,6 +208,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC=ON \
             -DENABLE_GUI=ON -DENABLE_TUI=OFF -DINSTALL_GMGET=OFF \
             -DENABLE_X11_XLIB=OFF -DENABLE_HARFBUZZ=OFF \
+            -DUNISTRING_DIR="$DEVKITPRO/portlibs/3ds" \
             2>&1 | tee port-report/lagrange-configure.log
           cmake --build /tmp/lagrange-3ds-build --parallel 2 \
             2>&1 | tee port-report/lagrange-build.log
