@@ -11,6 +11,21 @@ def edit(path, replacements):
     path.write_text(s)
 
 def sdl(root):
+    # A guest-side marker proves the dual-display update path was reached.
+    edit(root / "src/video/n3ds/SDL_n3dsframebuffer.c", [
+        ('#include "SDL_n3dsvideo.h"', '#include "SDL_n3dsvideo.h"\n#include <3ds/svc.h>'),
+        ("            FlushN3DSBuffer(dst, fbw * fbh * sizeof(u32), (gfxScreen_t)screen);\n        }\n        return true;",
+         """            FlushN3DSBuffer(dst, fbw * fbh * sizeof(u32), (gfxScreen_t)screen);
+        }
+        static bool reported = false;
+        if (!reported) {
+            static const char marker[] = "LAGRANGE_3DS_FIRST_FRAME";
+            svcOutputDebugString(marker, sizeof(marker) - 1);
+            reported = true;
+        }
+        return true;"""),
+    ])
+
     # ARM EABI uses short enums. Lagrange carries private scroll flags in
     # direction, so preserve the 32-bit representation across SDL and app.
     edit(root / "include/SDL3/SDL_mouse.h", [

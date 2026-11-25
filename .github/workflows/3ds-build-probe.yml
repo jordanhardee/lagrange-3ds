@@ -811,3 +811,90 @@ jobs:
           path: port-report/
           if-no-files-found: warn
           retention-days: 14
+
+  emulator-launch:
+    name: Experimental Azahar first-frame smoke test
+    needs: probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download browser from this exact build
+        uses: actions/download-artifact@v4
+        with:
+          name: 3ds-port-probe
+          path: port-report
+      - name: Launch pinned emulator with an empty virtual SD
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libegl1 libxcb-cursor0 imagemagick
+          mkdir -p emulator-report
+          export OUT="$PWD/emulator-report"
+          export ROM="$PWD/port-report/browser/lagrange.3dsx"
+          test -s "$ROM"
+          sha256sum "$ROM" > "$OUT/browser.sha256"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/lagrange-azahar/config"
+          export XDG_DATA_HOME="$RUNNER_TEMP/lagrange-azahar/data"
+          export XDG_CACHE_HOME="$RUNNER_TEMP/lagrange-azahar/cache"
+          mkdir -p "$XDG_CONFIG_HOME/azahar-emu" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+          cat > "$XDG_CONFIG_HOME/azahar-emu/qt-config.ini" <<'INI'
+          [Miscellaneous]
+          log_filter=*:Info Debug.Emulated:Debug
+          log_filter\default=false
+          [Data Storage]
+          use_virtual_sd=true
+          use_virtual_sd\default=false
+          [UI]
+          first_start=false
+          first_start\default=false
+          callout_flags=4294967295
+          callout_flags\default=false
+          pause_when_in_background=false
+          pause_when_in_background\default=false
+          INI
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 -o azahar.AppImage https://github.com/azahar-emu/azahar/releases/download/2127.0.1/azahar.AppImage
+          echo '496501b49b6b90b474047bb70de218e704e3681e42884e015be40001efb99442  azahar.AppImage' | sha256sum -c
+          chmod +x azahar.AppImage
+          ./azahar.AppImage --appimage-extract > "$OUT/appimage-extract.log"
+          export EMULATOR="$PWD/squashfs-root/AppRun"
+          export LIBGL_ALWAYS_SOFTWARE=1 QT_QPA_PLATFORM=xcb
+          xvfb-run -a -s '-screen 0 1280x1024x24' bash <<'SCRIPT'
+          set -euo pipefail
+          "$EMULATOR" "$ROM" > "$OUT/azahar-console.log" 2>&1 &
+          pid=$!
+          cleanup() {
+            import -window root "$OUT/screenshot.png" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            find "$XDG_DATA_HOME" -name azahar_log.txt -exec cp {} "$OUT/azahar_log.txt" \; || true
+            find "$XDG_DATA_HOME" -maxdepth 6 -type d > "$OUT/virtual-sd-directories.txt" || true
+          }
+          trap cleanup EXIT
+          for i in $(seq 1 90); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::Emulator exited before guest first-frame proof"
+              exit 1
+            fi
+            if grep -RFq --include='*.txt' --include='*.log' LAGRANGE_3DS_FIRST_FRAME "$XDG_DATA_HOME" "$OUT/azahar-console.log"; then
+              sleep 3
+              kill -0 "$pid"
+              test -d "$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/downloads"
+              test -d "$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/cache"
+              echo 'Guest reached dual-screen framebuffer update and created virtual SD storage.' | tee "$OUT/result.txt"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::No guest first-frame marker; inspect emulator logs and screenshot before attributing failure to Lagrange"
+          exit 1
+          SCRIPT
+      - name: Upload emulator evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3ds-emulator-launch
+          path: emulator-report/
+          if-no-files-found: warn
+          retention-days: 14
+
