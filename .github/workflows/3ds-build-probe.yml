@@ -258,7 +258,7 @@ jobs:
                 --openssldir=sdmc:/3ds/lagrange/openssl \
                 -D__3DS__ -DOPENSSL_USE_IPV6=0 -DOPENSSL_NO_UNIX_SOCK -DNO_SYSLOG -I"$DEVKITPRO/libctru/include" -I"$prefix/include" \
                 no-shared no-dso no-module no-asm no-async no-engine no-tests no-apps \
-                no-thread-pool --with-rand-seed=os
+                no-thread-pool no-ui-console no-quic --with-rand-seed=os
             # Keep compiling independent objects after errors to collect more diagnostics.
             # make still returns failure, so incomplete libraries are never installed.
             make -k -j2 build_libs
