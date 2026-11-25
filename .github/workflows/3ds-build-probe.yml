@@ -109,6 +109,25 @@ jobs:
           cp /tmp/smoke-build/lagrange-3ds-smoke.3dsx port-report/
           sha256sum port-report/*.3dsx > port-report/SHA256SUMS
 
+      - name: Build independent libctru software keyboard probe
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/keyboard-probe
+          cat > /tmp/keyboard-probe/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.15)
+          project(KeyboardProbe C)
+          add_executable(keyboard-probe "$ENV{GITHUB_WORKSPACE}/port/3ds/keyboard-probe.c")
+          target_link_libraries(keyboard-probe PRIVATE ctru)
+          ctr_generate_smdh(OUTPUT keyboard.smdh NAME "Keyboard Probe"
+            DESCRIPTION "Independent libctru applet test" AUTHOR "Lagrange 3DS project")
+          ctr_create_3dsx(keyboard-probe SMDH keyboard.smdh)
+          EOF
+          cmake -S /tmp/keyboard-probe -B /tmp/keyboard-probe-build \
+            -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/keyboard-probe-build --parallel 2
+          cp /tmp/keyboard-probe-build/keyboard-probe.3dsx port-report/
+          dkp-pacman -Q libctru > port-report/keyboard-probe-libctru-version.txt
+
       - name: Restore pinned GNU libunistring source cache
         id: unistring_cache
         if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
@@ -896,6 +915,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb xauth libgl1-mesa-dri libegl1 libopengl0 libglx0 libvulkan1 mesa-vulkan-drivers libxcb-cursor0 libxkbcommon-x11-0 libxcb-xkb1 libxcb-icccm4 libxcb-keysyms1 libxcb-xinerama0 libxcb-randr0 libxcb-shape0 libxcb-xfixes0 libjack-jackd2-0 libpulse0 libasound2t64 imagemagick xdotool python3-pil
           export ROM="$PWD/port-report/browser/lagrange.3dsx"
+          export KEYBOARD_PROBE="$PWD/port-report/keyboard-probe.3dsx"
+          test -s "$KEYBOARD_PROBE"
           test -s "$ROM"
           sha256sum "$ROM" > "$OUT/browser.sha256"
           export XDG_CONFIG_HOME="$RUNNER_TEMP/lagrange-azahar/config"
@@ -904,7 +925,7 @@ jobs:
           mkdir -p "$XDG_CONFIG_HOME/azahar-emu" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
           cat > "$XDG_CONFIG_HOME/azahar-emu/qt-config.ini" <<'INI'
           [Miscellaneous]
-          log_filter=*:Info Debug.Emulated:Debug
+          log_filter=*:Info Debug.Emulated:Debug Service.APT:Debug Service.GSP:Debug Applet.SWKBD:Debug
           log_filter\default=false
           [Data Storage]
           use_virtual_sd=true
@@ -944,6 +965,12 @@ jobs:
           /usr/bin/python3 -c 'import ssl, PIL; print(ssl.OPENSSL_VERSION); print("Pillow", PIL.__version__)' | tee "$OUT/fixture-python-version.txt"
           xvfb-run -a -s '-screen 0 1280x1024x24' bash <<'SCRIPT'
           set -euo pipefail
+          # Independent comparison; never treat it as a browser acceptance pass.
+          mkdir -p "$OUT/keyboard-probe"
+          XDG_DATA_HOME="$XDG_DATA_HOME-probe" \
+            OUT="$OUT/keyboard-probe" \
+            /usr/bin/python3 "$GITHUB_WORKSPACE/port/3ds/keyboard-probe-host.py" \
+            || echo "::warning::Independent keyboard probe did not pass; inspect its evidence"
           env LD_LIBRARY_PATH="$AZAHAR_LIBRARY_PATH" LIBGL_ALWAYS_SOFTWARE=1 QT_QPA_PLATFORM=xcb "$EMULATOR" "$ROM" > "$OUT/azahar-console.log" 2>&1 &
           pid=$!
           cleanup() {
