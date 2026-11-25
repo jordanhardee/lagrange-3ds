@@ -42,6 +42,8 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL.git /tmp/SDL3
           test "$(git -C /tmp/SDL3 rev-parse HEAD)" = f00dc919ca35b9756316e86c4777392de442f9b2
+          python3 port/3ds/handheld-ui.py sdl /tmp/SDL3
+          git -C /tmp/SDL3 diff > port-report/sdl3-dualscreen.patch
           cmake -S /tmp/SDL3 -B /tmp/sdl-build \
             -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
             -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=OFF -DSDL_STATIC=ON \
@@ -735,6 +737,8 @@ jobs:
           s = s.replace(old, "    deinit_Foundation();\n#ifdef __3DS__\n    exitSoc_3ds_();\n#endif\n    return 0;")
           p.write_text(s)
           PY
+            python3 port/3ds/handheld-ui.py app .
+            git diff -- app > port-report/lagrange-handheld-ui.patch
             # Add static transitive dependencies explicitly, without rewriting
             # desktop library names or adding unresolved host libraries.
             cat >> CMakeLists.txt <<'EOF'
@@ -781,6 +785,7 @@ jobs:
             -DENABLE_X11_XLIB=OFF -DENABLE_HARFBUZZ=OFF \
             -DENABLE_IPC=OFF -DENABLE_DOWNLOAD_EDIT=OFF -DENABLE_FILE_REVEAL=OFF \
             -DENABLE_RELATIVE_EMBED=ON \
+            -DENABLE_MOBILE_HANDHELD=ON -DENABLE_POPUP_MENUS=OFF \
             -DUNISTRING_DIR="$DEVKITPRO/portlibs/3ds" \
             2>&1 | tee port-report/lagrange-configure.log
           # The toolchain and target portlibs already supply static archives.
