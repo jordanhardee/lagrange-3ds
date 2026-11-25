@@ -315,6 +315,22 @@ jobs:
           assert s.count(old) == 1, "unexpected OpenSSL entropy backend"
           p.write_text(s.replace(old, new))
           PY
+            # 3DS has no Unix real/effective UID distinction and no
+            # posix_memalign implementation. Use OpenSSL's native fallback.
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crypto/uid.c")
+          s = p.read_text()
+          old = "|| defined(__wasi__)"
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, old + " || defined(__3DS__)"))
+          p = Path("crypto/mem.c")
+          s = p.read_text()
+          old = "#if defined(_BSD_SOURCE) || (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L)"
+          assert s.count(old) == 1
+          s = s.replace(old, "#if defined(__3DS__)\n        /* Fall through to OpenSSL's portable aligned allocator. */\n#elif defined(_BSD_SOURCE) || (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L)")
+          p.write_text(s)
+          PY
             # Generic ARM/newlib target, not a Linux target. Keep thread safety
             # and OS entropy enabled; runtime entropy and TLS need hardware validation.
             cat > Configurations/99-nintendo-3ds.conf <<'EOF'
@@ -391,12 +407,17 @@ jobs:
           export PKG_CONFIG_LIBDIR="$DEVKITPRO/portlibs/3ds/lib/pkgconfig:$DEVKITPRO/portlibs/armv6k/lib/pkgconfig"
           cmake -S . -B /tmp/lagrange-3ds-build \
             -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
-            -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC=ON \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC=OFF \
             -DENABLE_GUI=ON -DENABLE_TUI=OFF -DINSTALL_GMGET=OFF \
             -DENABLE_X11_XLIB=OFF -DENABLE_HARFBUZZ=OFF \
             -DUNISTRING_DIR="$DEVKITPRO/portlibs/3ds" \
             2>&1 | tee port-report/lagrange-configure.log
-          cmake --build /tmp/lagrange-3ds-build --parallel 2 \
+          # The toolchain and target portlibs already supply static archives.
+          # Avoid upstream's desktop-specific archive-name rewriting.
+          # Record the relevant pinned Foundation source for porting analysis.
+          cp lib/the_Foundation/src/address.c port-report/foundation-address.c
+          grep -n -E 'ifaddrs|getifaddrs|freeifaddrs|AF_INET6|sockaddr_in6|socketpair|pipe\(' lib/the_Foundation/src/*.c > port-report/foundation-platform-apis.txt || true
+          cmake --build /tmp/lagrange-3ds-build --parallel 2 -- -k \
             2>&1 | tee port-report/lagrange-build.log
 
       - name: Upload diagnostics and smoke-test binary if available
