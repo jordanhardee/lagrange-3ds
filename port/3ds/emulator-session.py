@@ -72,14 +72,18 @@ class Capsule(socketserver.BaseRequestHandler):
                 elif path == "/second":
                     body = "# PORT ACCEPTANCE BRAVO\n\nSecond page reached via controller navigation.\n"
                 else:
-                    conn.sendall(b"51 Not found\r\n")
-                    return
-                conn.sendall(("20 text/gemini; charset=utf-8\r\n" + body + "\n").encode())
+                    body = None
+                # Record unsuccessful requests too, including cancelled URLs.
                 with lock:
-                    event = {"url": url, "tls": conn.version(), "cipher": conn.cipher()[0], "status": 20}
+                    event = {"url": url, "tls": conn.version(), "cipher": conn.cipher()[0],
+                             "status": 20 if body is not None else 51}
                     requests.append(event)
                     with REQUESTS.open("a") as f:
                         f.write(json.dumps(event) + "\n")
+                if body is None:
+                    conn.sendall(b"51 Not found\r\n")
+                else:
+                    conn.sendall(("20 text/gemini; charset=utf-8\r\n" + body + "\n").encode())
         except (OSError, ssl.SSLError, UnicodeError) as exc:
             with lock, (OUT / "gemini-server-errors.log").open("a") as f:
                 f.write(repr(exc) + "\n")
@@ -142,11 +146,83 @@ def press(key, duration=0.15):
     run("xdotool", "keyup", key)
 
 
-def open_keyboard(bottom, main_window):
+def keyboard_box(img, top):
+    # Pinned Qt HLE keyboard: locate the light-gray 200x94 dialog on
+    # the black applet background (verified against run 45700896528).
+    cx = (top[0] + top[2]) // 2
+    for y in range(top[1] + 100, top[1] + 300):
+        def gray(x, yy):
+            r, g, b = img.getpixel((x, yy))
+            return 220 <= r <= 249 and abs(r-g) <= 3 and abs(r-b) <= 3
+        def dark(x, yy):
+            return max(img.getpixel((x, yy))) < 40
+        if not gray(cx, y) or not dark(cx, y - 1):
+            continue
+        left = right = cx
+        while left > cx - 350 and gray(left - 1, y):
+            left -= 1
+        while right < cx + 350 and gray(right, y):
+            right += 1
+        if not 180 <= right - left <= 350:
+            continue
+        bottom = y
+        while bottom < y + 160 and gray(left + 2, bottom):
+            bottom += 1
+        if 75 <= bottom - y <= 150 and dark(left - 1, y + 5) and dark(right, y + 5):
+            return left, y, right, bottom
+    return None
+
+
+def open_keyboard(top, bottom, name):
     click(bottom[0] + 100, bottom[1] + 23)
-    dialog = wait_for(lambda: (w if (w := focus()) != main_window else None),
-                      "Touching the address bar did not open the native keyboard", 12)
-    return dialog
+    box = wait_for(lambda: keyboard_box(screenshot(name), top),
+                   "Touching address bar did not open the Qt software keyboard", 12)
+    print(f"Keyboard bounds: {box}; focused window: {focus()}", flush=True)
+    return box
+
+
+def type_address(box, address, name):
+    x1, y1, x2, y2 = box
+    click((x1 + x2) // 2, y2 - 52)
+    time.sleep(0.3)
+    before = screenshot(name + "-before").crop((x1 + 12, y2 - 64, x2 - 12, y2 - 41))
+    run("xdotool", "key", "ctrl+a")
+    run("xdotool", "type", "--clearmodifiers", "--delay", "35", address)
+    time.sleep(0.3)
+    after = screenshot(name).crop((x1 + 12, y2 - 64, x2 - 12, y2 - 41))
+    if difference(before, after) < 0.015:
+        raise AssertionError("Keyboard input field did not visibly change after typing")
+
+
+def keyboard_results():
+    path = Path(os.environ["XDG_DATA_HOME"]) / "azahar-emu" / "log" / "azahar_log.txt"
+    try:
+        return [line for line in path.read_text(errors="replace").splitlines()
+                if "SWKBD input dialog finished, text=" in line]
+    except OSError:
+        return []
+
+
+def finish_keyboard(box, top, main_window, submit, address=""):
+    x1, y1, x2, y2 = box
+    previous = len(keyboard_results())
+    # Use actual OK/Cancel buttons. Escape returned an invalid applet
+    # button code (143) in the previous emulator run.
+    click(x1 + round((x2-x1) * (0.315 if submit else 0.745)), y2 - 23)
+    expected = f"text={address if submit else ''}, button={1 if submit else 0}"
+    def result():
+        lines = keyboard_results()[previous:]
+        return lines[0] if lines else None
+    line = wait_for(result, "Azahar did not report a software keyboard result", 12)
+    print(line, flush=True)
+    if expected not in line:
+        raise AssertionError(f"Unexpected software keyboard result: {line}; expected {expected}")
+    # Wait for the applet to return, then make sure a duplicate did not open.
+    time.sleep(1)
+    wait_for(lambda: keyboard_box(screenshot("keyboard-after-submit" if submit else "keyboard-after-cancel"), top) is None,
+             "Software keyboard remained visible or reopened after button click", 12)
+    run("xdotool", "windowfocus", main_window)
+    time.sleep(0.5)
 
 
 def difference(a, b):
@@ -184,24 +260,18 @@ def session():
         main_window = focus()
         record(current, "pass", f"top={top}, bottom={bottom}, focus={main_window}")
         current = "keyboard_cancel"
-        open_keyboard(bottom, main_window)
-        screenshot("02-keyboard-cancel")
-        run("xdotool", "key", "ctrl+a")
-        run("xdotool", "type", "--clearmodifiers", BASE + "/cancelled")
-        press("Escape")
-        wait_for(lambda: focus() == main_window, "Keyboard did not close after cancel", 10)
+        box = open_keyboard(top, bottom, "02-keyboard-cancel")
+        type_address(box, BASE + "/cancelled", "02-keyboard-cancel-typed")
+        finish_keyboard(box, top, main_window, False)
         time.sleep(1)
         if requests:
             raise AssertionError("Cancelled address unexpectedly reached the Gemini fixture")
         record(current, "pass", "Keyboard closed; fixture received no request")
 
         current = "keyboard_submit"
-        open_keyboard(bottom, main_window)
-        run("xdotool", "key", "ctrl+a")
-        run("xdotool", "type", "--clearmodifiers", BASE + "/start")
-        screenshot("03-keyboard-address")
-        press("Return")
-        wait_for(lambda: focus() == main_window, "Keyboard did not return to browser", 10)
+        box = open_keyboard(top, bottom, "03-keyboard-open")
+        type_address(box, BASE + "/start", "03-keyboard-address")
+        finish_keyboard(box, top, main_window, True, BASE + "/start")
         record(current, "pass", "Address submitted through the native software keyboard")
 
         current = "gemini_tls"
