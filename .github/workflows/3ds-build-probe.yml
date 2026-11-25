@@ -832,8 +832,10 @@ jobs:
     name: Experimental Azahar first-frame smoke test
     needs: probe
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
+      - name: Check out matching test harness
+        uses: actions/checkout@v4
       - name: Download browser from this exact build
         uses: actions/download-artifact@v4
         with:
@@ -845,7 +847,7 @@ jobs:
           mkdir -p emulator-report
           export OUT="$PWD/emulator-report"
           sudo apt-get update
-          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libegl1 libopengl0 libglx0 libvulkan1 mesa-vulkan-drivers libxcb-cursor0 libxkbcommon-x11-0 libxcb-xkb1 libxcb-icccm4 libxcb-keysyms1 libxcb-xinerama0 libxcb-randr0 libxcb-shape0 libxcb-xfixes0 libjack-jackd2-0 libpulse0 libasound2t64 imagemagick
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libegl1 libopengl0 libglx0 libvulkan1 mesa-vulkan-drivers libxcb-cursor0 libxkbcommon-x11-0 libxcb-xkb1 libxcb-icccm4 libxcb-keysyms1 libxcb-xinerama0 libxcb-randr0 libxcb-shape0 libxcb-xfixes0 libjack-jackd2-0 libpulse0 libasound2t64 imagemagick xdotool python3-pil
           export ROM="$PWD/port-report/browser/lagrange.3dsx"
           test -s "$ROM"
           sha256sum "$ROM" > "$OUT/browser.sha256"
@@ -860,7 +862,12 @@ jobs:
           [Data Storage]
           use_virtual_sd=true
           use_virtual_sd\default=false
+          [System]
+          lle_applets=false
+          lle_applets\default=false
           [UI]
+          use_on_screen_software_keyboard=false
+          use_on_screen_software_keyboard\default=false
           first_start=false
           first_start\default=false
           callout_flags=4294967295
@@ -929,6 +936,7 @@ jobs:
               test -d "$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/downloads"
               test -d "$XDG_DATA_HOME/azahar-emu/sdmc/3ds/lagrange/cache"
               echo 'Guest reached dual-screen framebuffer update and created virtual SD storage.' | tee "$OUT/result.txt"
+              python3 "$GITHUB_WORKSPACE/port/3ds/emulator-session.py" "$pid"
               exit 0
             fi
             sleep 1
