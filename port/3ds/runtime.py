@@ -80,6 +80,7 @@ static const char *defaultDownloadDir_App_ = "~/Downloads";
                            "/3ds/lagrange/downloads", "/3ds/lagrange/cache" };
     if (chdir("sdmc:/") != 0) {
         fprintf(stderr, "[3DS] SD card unavailable\\n");
+        exitSoc_3ds_();
         return 1;
     }
     for (size_t i = 0; i < sizeof(dirs)/sizeof(dirs[0]); ++i) {
@@ -87,6 +88,7 @@ static const char *defaultDownloadDir_App_ = "~/Downloads";
         if ((mkdir(dirs[i], 0700) != 0 && errno != EEXIST) ||
             stat(dirs[i], &st) != 0 || !S_ISDIR(st.st_mode)) {
             fprintf(stderr, "[3DS] cannot initialize storage directory: %s\\n", dirs[i]);
+            exitSoc_3ds_();
             return 1;
         }
     }
@@ -111,9 +113,27 @@ static const char *defaultDownloadDir_App_ = "~/Downloads";
         ("enum iMouseWheelFlag {",
          """#ifdef __3DS__
 _Static_assert(sizeof(SDL_MouseWheelDirection) == 4, "SDL scroll flags require a 32-bit enum");
-_Static_assert((SDL_MouseWheelDirection)768 == 768, "SDL scroll flags truncated");
+_Static_assert((SDL_MouseWheelDirection)512 == 512 &&
+               (SDL_MouseWheelDirection)1024 == 1024 &&
+               (SDL_MouseWheelDirection)2048 == 2048, "SDL scroll flags truncated");
 #endif
 enum iMouseWheelFlag {"""),
+    ])
+    # A focused editor or open popup owns the Circle Pad, not the document.
+    # Stop pending scroll immediately on switching modes.
+    edit(root / "app/src/ui/gamepad.c", [
+        ("            if (!d->panelFocus && axis->axis == SDL_GAMEPAD_AXIS_LEFTY) {",
+         """            const iBool reading = !d->panelFocus && !isInputFocused_() &&
+                                  isEmpty_PtrSet(d->openMenus);
+            if (!reading && !d->panelFocus) {
+                d->scrollSpeed = 0;
+                d->scrollAccum = 0;
+            }
+            if (reading && axis->axis == SDL_GAMEPAD_AXIS_LEFTY) {"""),
+        ("            if (!d->panelFocus && axis->axis == SDL_GAMEPAD_AXIS_LEFTX) return iTrue;",
+         "            if (reading && axis->axis == SDL_GAMEPAD_AXIS_LEFTX) return iTrue;"),
+        ("                    d->scrollSpeed = 0;\n                    d->pointerSpeed[0] = d->pointerSpeed[1] = 0;",
+         "                    d->scrollSpeed = 0;\n                    d->scrollAccum = 0;\n                    d->pointerSpeed[0] = d->pointerSpeed[1] = 0;"),
     ])
     edit(root / "app/src/ui/inputwidget.c", [
         ('#include "input/impl.h"',
@@ -131,13 +151,14 @@ enum iMouseWheelFlag {"""),
             /* Single-line ordinary inputs use the system keyboard. Keep the
                themed editor for PEMs, uploads, sensitive input and long text. */
             if (!alreadyEditing && method != arrowKeys_FocusMethod &&
-                !(d->inFlags & (lineBreaksEnabled_InputWidgetFlag |
-                               isSensitive_InputWidgetFlag))) {
+                !isAllowedToInsertNewline_InputWidget_(d) &&
+                !(d->inFlags & isSensitive_InputWidgetFlag)) {
                 const iString *initial = text_InputWidget(d);
+                const int maxChars = d->maxLen > 0 && d->maxLen < 1024 ? d->maxLen : 1024;
                 if (size_String(initial) < 1024) {
                     SwkbdState keyboard;
                     char result[4096] = {0};
-                    swkbdInit(&keyboard, SWKBD_TYPE_NORMAL, 2, 1024);
+                    swkbdInit(&keyboard, SWKBD_TYPE_NORMAL, 2, maxChars);
                     swkbdSetInitialText(&keyboard, cstr_String(initial));
                     const SwkbdButton button = swkbdInputText(&keyboard, result, sizeof(result));
                     if (button == SWKBD_BUTTON_CONFIRM) {
@@ -145,15 +166,19 @@ enum iMouseWheelFlag {"""),
                         contentsWereChanged_InputWidget_(d);
                         /* Submit the address field; other fields retain the
                            normal dialog-level confirmation controls. */
-                        if (d->inFlags & isUrl_InputWidgetFlag)
+                        if ((d->inFlags & isUrl_InputWidgetFlag) &&
+                            !cmp_String(id_Widget(w), "url"))
                             d->inFlags |= enterPressed_InputWidgetFlag;
                         end_InputWidget(d, iTrue);
                     }
-                    else {
+                    else if (button == SWKBD_BUTTON_LEFT) {
                         end_InputWidget(d, iFalse);
                     }
                     memset(result, 0, sizeof(result));
-                    setFocus_Widget(NULL);
+                    /* Applet errors (including an emulator without keyboard support)
+                       must leave the existing themed editor available. */
+                    if (button == SWKBD_BUTTON_CONFIRM || button == SWKBD_BUTTON_LEFT)
+                        setFocus_Widget(NULL);
                     postRefresh_Window(window_Widget(w));
                 }
             }
