@@ -430,7 +430,27 @@ jobs:
           p = root / "src/address.c"
           s = p.read_text()
           assert s.count("<ifaddrs.h>") == 1, "unexpected interface discovery include"
-          p.write_text(s.replace("<ifaddrs.h>", '"ifaddrs_3ds.h"'))
+          s = s.replace("<ifaddrs.h>", '"ifaddrs_3ds.h"')
+          # The private interface header supplies the only IFF flags used.
+          # libctru advertises AF_INET6 but does not implement sockaddr_in6.
+          def replace_one(old, new):
+              global s
+              assert s.count(old) == 1, "unexpected address source: " + old
+              s = s.replace(old, new)
+          replace_one("#  include <net/if.h>\n", "")
+          replace_one('#include "networkproxy.h"', '#undef AI_V4MAPPED_CFG\n#define AI_V4MAPPED_CFG 0\n\n#include "networkproxy.h"')
+          replace_one("(d->socktype == SOCK_DGRAM ? AF_INET     : AF_UNSPEC /* v4 or v6 */)", "AF_INET")
+          replace_one("        .ai_family   = AF_UNSPEC,", "        .ai_family   = AF_INET,")
+          replace_one("    return sizeof(struct sockaddr_in6);", "    return d->ai_addrlen;")
+          replace_one("        case AF_INET6:\n            return ((const struct sockaddr_in6 *) d->ai_addr)->sin6_port;\n", "")
+          replace_one("        case AF_INET6: {\n            const struct sockaddr_in6 *s1 = (const struct sockaddr_in6 *) d->ai_addr;\n            const struct sockaddr_in6 *s2 = (const struct sockaddr_in6 *) other->ai_addr;\n            return !memcmp(&s1->sin6_addr, &s2->sin6_addr, sizeof(s1->sin6_addr));\n        }\n", "")
+          replace_one("    d->info->ai_family = (sockAddrSize == sizeof(struct sockaddr_in6) ? AF_INET6 : AF_INET);", "    d->info->ai_family = ((const struct sockaddr *) sockAddr)->sa_family;")
+          replace_one("                     addr->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6)\n                                                 : sizeof(struct sockaddr),", "                     sizeof(struct sockaddr_in),")
+          replace_one("    iString *str = new_String();\n    if (!getnameinfo(addr,", "    iString *str = new_String();\n    if (!addr || addr->sa_family != AF_INET) return str;\n    if (!getnameinfo(addr,")
+          replace_one("            if (sockAddr->sa_family != AF_INET && sockAddr->sa_family != AF_INET6) continue;", "            if (sockAddr->sa_family != AF_INET) continue;")
+          replace_one("            const socklen_t size = sockAddr->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6)\n                                                                   : sizeof(struct sockaddr_in);", "            const socklen_t size = sizeof(struct sockaddr_in);")
+          assert "struct sockaddr_in6" not in s, "remaining unsupported IPv6 structures"
+          p.write_text(s)
           # No global fake socket definitions: this header is private to address.c.
           (root / "src/ifaddrs_3ds.h").write_text(r"""#pragma once
           #include <3ds/types.h>
