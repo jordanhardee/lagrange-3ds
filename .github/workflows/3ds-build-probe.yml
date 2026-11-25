@@ -120,14 +120,19 @@ jobs:
             echo '5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c  libunistring-1.4.2.tar.xz' | sha256sum -c -
             tar -xf libunistring-1.4.2.tar.xz
             cd libunistring-1.4.2
-            # Newlib exposes locale names through nl_langinfo_l, like musl.
-            # Only enable this branch if the target headers provide NL_LOCALE_NAME.
+            # Configure found native getlocalename_l; use the libc function
+            # directly for per-thread locale objects rather than a guessed name.
             python3 - <<'PY'
           from pathlib import Path
           p = Path("lib/getlocalename_l-unsafe.c")
           s = p.read_text()
           old = "#elif defined __linux__ && HAVE_LANGINFO_H && defined NL_LOCALE_NAME"
-          new = "#elif (defined __linux__ || defined __3DS__) && HAVE_LANGINFO_H && defined NL_LOCALE_NAME"
+          new = """#elif defined __3DS__ && HAVE_GETLOCALENAME_L
+          # undef getlocalename_l
+                extern const char *getlocalename_l (int, locale_t);
+                const char *name = getlocalename_l (category, locale);
+                return (struct string_with_storage) { name ? name : "", STORAGE_OBJECT };
+          """ + old
           assert s.count(old) == 1, "unexpected libunistring locale source"
           p.write_text(s.replace(old, new))
           PY
@@ -196,6 +201,21 @@ jobs:
             echo '603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  openssl-3.5.9.tar.gz' | sha256sum -c -
             tar -xf openssl-3.5.9.tar.gz
             cd openssl-3.5.9
+            # libctru provides getaddrinfo, but not the legacy getservbyname
+            # service database. Compile only the modern resolver on 3DS.
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crypto/bio/bio_addr.c")
+          s = p.read_text()
+          old = "    } else {\n#endif\n        const struct hostent *he;"
+          new = "#if !defined(__3DS__)\n    } else {\n#endif\n#endif\n#if !defined(__3DS__)\n        const struct hostent *he;"
+          assert s.count(old) == 1, "unexpected OpenSSL lookup fallback"
+          s = s.replace(old, new)
+          old = "        CRYPTO_THREAD_unlock(bio_lookup_lock);\n    }\n\n    return ret;"
+          new = "        CRYPTO_THREAD_unlock(bio_lookup_lock);\n#endif\n    }\n\n    return ret;"
+          assert s.count(old) == 1, "unexpected OpenSSL lookup fallback ending"
+          p.write_text(s.replace(old, new))
+          PY
             # Generic ARM/newlib target, not a Linux target. Keep thread safety
             # and OS entropy enabled; runtime entropy and TLS need hardware validation.
             cat > Configurations/99-nintendo-3ds.conf <<'EOF'
