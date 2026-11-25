@@ -32,8 +32,10 @@ jobs:
           dkp-pacman -Q > port-report/installed-packages.txt
           dkp-pacman -Sl > port-report/available-packages.txt
           grep -Ei 'openssl|unistring|pcre|sdl|zlib|freetype|harfbuzz|fribidi' port-report/available-packages.txt || true
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git submodule sync --recursive
           git submodule update --init lib/the_Foundation
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/lib/the_Foundation"
 
       - name: Build SDL3 for ARM (pinned upstream revision)
         run: |
