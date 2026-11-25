@@ -570,6 +570,169 @@ jobs:
           replace_process("    if (d->pid) {\n        /* Allow zombies to terminate. */\n        int status = 0;\n        waitpid(d->pid, &status, WNOHANG);\n    }", "#ifndef __3DS__\n    if (d->pid) {\n        /* Allow zombies to terminate. */\n        int status = 0;\n        waitpid(d->pid, &status, WNOHANG);\n    }\n#endif")
           replace_process("    if (!d->pid) return;\n    closeInput_Pipe(&d->pin); /* no more input */", "#ifdef __3DS__\n    iUnused(d);\n#else\n    if (!d->pid) return;\n    closeInput_Pipe(&d->pin); /* no more input */")
           replace_process("    d->pid = 0;\n}\n\nsize_t writeInput_Process", "    d->pid = 0;\n#endif\n}\n\nsize_t writeInput_Process")
+          # No child process I/O on this platform: don't allocate three
+          # wakeup socket pairs for an operation that cannot be started.
+          replace_process("    init_Pipe(&d->pin);\n    init_Pipe(&d->pout);\n    init_Pipe(&d->perr);", "#ifdef __3DS__\n    d->pin.fds[0] = d->pin.fds[1] = -1;\n    d->pout.fds[0] = d->pout.fds[1] = -1;\n    d->perr.fds[0] = d->perr.fds[1] = -1;\n#else\n    init_Pipe(&d->pin);\n    init_Pipe(&d->pout);\n    init_Pipe(&d->perr);\n#endif")
+          p.write_text(s)
+
+          # Socket-backed wakeup pipe: the socket/service/datagram threads
+          # need descriptors usable with libctru poll/select. No LAN listener.
+          # Retain the original file's copyright and license header.
+          p = root / "src/platform/posix/pipe.c"
+          s = p.read_text()
+          anchor = "iDefineTypeConstruction(Pipe)\n"
+          assert s.count(anchor) == 1, "unexpected Foundation pipe source"
+          s = s.replace(anchor, r"""#include <sys/socket.h>
+          #include <netinet/in.h>
+          #include <arpa/inet.h>
+          #include <poll.h>
+
+          iDefineTypeConstruction(Pipe)
+
+          /* Make a private TCP socket pair on 127.0.0.1, not INADDR_ANY.
+           * Use ephemeral ports, check the accepted peer, and never leave
+           * a listening socket open after creation. No socketpair on 3DS. */
+          static int makeWakePair_3ds_(int fds[2]) {
+              int listener = -1, writer = -1, reader = -1;
+              int saved = 0, rc, err = 0;
+              struct sockaddr_in addr = {0}, local = {0}, peer = {0};
+              socklen_t n = sizeof(addr);
+              fds[0] = fds[1] = -1;
+              addr.sin_family = AF_INET;
+              addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+              listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+              if (listener < 0) goto fail;
+              if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+                  listen(listener, 1) != 0 ||
+                  getsockname(listener, (struct sockaddr *)&addr, &n) != 0)
+                  goto fail;
+              if (addr.sin_family != AF_INET ||
+                  addr.sin_addr.s_addr != htonl(INADDR_LOOPBACK) || addr.sin_port == 0) {
+                  errno = EADDRNOTAVAIL;
+                  goto fail;
+              }
+              if (fcntl(listener, F_SETFL, O_NONBLOCK) != 0) goto fail;
+              writer = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+              if (writer < 0 || fcntl(writer, F_SETFL, O_NONBLOCK) != 0) goto fail;
+              rc = connect(writer, (struct sockaddr *)&addr, sizeof(addr));
+              if (rc != 0) {
+                  if (errno != EINPROGRESS && errno != EWOULDBLOCK && errno != EAGAIN)
+                      goto fail;
+                  struct pollfd pending = { .fd = writer, .events = POLLOUT };
+                  rc = poll(&pending, 1, 2000);
+                  if (rc <= 0) { if (rc == 0) errno = ETIMEDOUT; goto fail; }
+                  n = sizeof(err);
+                  if (getsockopt(writer, SOL_SOCKET, SO_ERROR, &err, &n) != 0)
+                      goto fail;
+                  if (err != 0) { errno = err; goto fail; }
+              }
+              n = sizeof(local);
+              if (getsockname(writer, (struct sockaddr *)&local, &n) != 0)
+                  goto fail;
+              struct pollfd ready = { .fd = listener, .events = POLLIN };
+              rc = poll(&ready, 1, 2000);
+              if (rc <= 0) { if (rc == 0) errno = ETIMEDOUT; goto fail; }
+              n = sizeof(peer);
+              reader = accept(listener, (struct sockaddr *)&peer, &n);
+              if (reader < 0) goto fail;
+              if (local.sin_family != AF_INET || peer.sin_family != AF_INET ||
+                  local.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
+                  peer.sin_addr.s_addr != local.sin_addr.s_addr ||
+                  peer.sin_port != local.sin_port) {
+                  errno = ECONNABORTED;
+                  goto fail;
+              }
+              if (fcntl(reader, F_SETFL, O_NONBLOCK) != 0) goto fail;
+              close(listener);
+              fds[0] = reader;
+              fds[1] = writer;
+              return 0;
+          fail:
+              saved = errno;
+              if (reader >= 0) close(reader);
+              if (writer >= 0) close(writer);
+              if (listener >= 0) close(listener);
+              errno = saved;
+              return -1;
+          }
+          """)
+          old = """#if defined (iHavePipe2)
+              if (pipe2(d->fds, O_CLOEXEC)) {
+          #else
+              if (pipe(d->fds)) {
+          #endif"""
+          assert s.count(old) == 1, "unexpected pipe initialization"
+          s = s.replace(old, "    if (makeWakePair_3ds_(d->fds)) {")
+          old = """#if !defined (iHavePipe2)
+              fcntl(d->fds[0], F_SETFD, FD_CLOEXEC);
+              fcntl(d->fds[1], F_SETFD, FD_CLOEXEC);
+          #endif"""
+          assert s.count(old) == 1, "unexpected pipe close-on-exec"
+          s = s.replace(old, "")
+          old = "    return write(input_Pipe(d), data, size);"
+          assert s.count(old) == 1
+          s = s.replace(old, """    if (input_Pipe(d) < 0) { errno = EBADF; return 0; }
+              ssize_t n;
+              do { n = send(input_Pipe(d), data, size, 0); } while (n < 0 && errno == EINTR);
+              /* Every current network wakeup is one byte. A full send queue
+               * already contains wakeups; don't block holding a mutex. */
+              if (n < 0 && size == 1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                  return 1;
+              if (n < 0) {
+                  iWarning("[pipe] wakeup send failed: %i %s\\n", errno, strerror(errno));
+                  return 0;
+              }
+              return (size_t)n;""")
+          old = "    return read(output_Pipe(d), data_out, size);"
+          assert s.count(old) == 1
+          s = s.replace(old, """    if (output_Pipe(d) < 0) { errno = EBADF; return 0; }
+              ssize_t n;
+              do { n = recv(output_Pipe(d), data_out, size, 0); } while (n < 0 && errno == EINTR);
+              return n < 0 ? 0 : (size_t)n;""")
+          p.write_text(s)
+
+          # The SDL3 3DS backend mounts romfs but does not initialize SOC.
+          # Do it before Foundation starts creating sockets and stop it
+          # only after its networking threads have been torn down.
+          p = Path("app/src/main.c")
+          s = p.read_text()
+          old = "#include <signal.h>\n"
+          assert s.count(old) == 1
+          s = s.replace(old, old + """
+          #ifdef __3DS__
+          #include <3ds/types.h>
+          #include <3ds/services/soc.h>
+          #include <malloc.h>
+          #include <stdlib.h>
+          static u32 *socBuffer_;
+          static int initSoc_3ds_(void) {
+              socBuffer_ = memalign(0x1000, 0x100000);
+              if (!socBuffer_) return 0;
+              if (socInit(socBuffer_, 0x100000) != 0) {
+                  free(socBuffer_);
+                  socBuffer_ = NULL;
+                  return 0;
+              }
+              return 1;
+          }
+          static void exitSoc_3ds_(void) {
+              if (socBuffer_) {
+                  socExit();
+                  free(socBuffer_);
+                  socBuffer_ = NULL;
+              }
+          }
+          #endif
+          """)
+          old = "int main(int argc, char **argv) {\n"
+          assert s.count(old) == 1
+          s = s.replace(old, old + "#ifdef __3DS__\n    if (!initSoc_3ds_()) {\n        fprintf(stderr, \"[3DS] SOC initialization failed\\n\");\n        return 1;\n    }\n#endif\n")
+          old = "        deinit_Foundation();\n        return -1;"
+          assert s.count(old) == 1
+          s = s.replace(old, "        deinit_Foundation();\n#ifdef __3DS__\n        exitSoc_3ds_();\n#endif\n        return -1;")
+          old = "    deinit_Foundation();\n    return 0;"
+          assert s.count(old) == 1
+          s = s.replace(old, "    deinit_Foundation();\n#ifdef __3DS__\n    exitSoc_3ds_();\n#endif\n    return 0;")
           p.write_text(s)
           PY
             # Add static transitive dependencies explicitly, without rewriting
@@ -583,6 +746,17 @@ jobs:
               find_package(PNG REQUIRED)
               find_package(BZip2 REQUIRED)
               target_link_libraries(app PUBLIC PNG::PNG BZip2::BZip2)
+              # The archive is generated at CMake configuration time.
+              set(N3DS_ROMFS "${CMAKE_BINARY_DIR}/lagrange-romfs")
+              file(MAKE_DIRECTORY "${N3DS_ROMFS}")
+              configure_file("${CMAKE_BINARY_DIR}/app/resources.lgr"
+                             "${N3DS_ROMFS}/resources.lgr" COPYONLY)
+              target_compile_definitions(app PRIVATE LAGRANGE_EMB_BIN="romfs:/resources.lgr")
+              ctr_generate_smdh(OUTPUT "${CMAKE_BINARY_DIR}/lagrange.smdh"
+                                NAME "Lagrange" DESCRIPTION "Gemini browser - experimental 3DS port"
+                                AUTHOR "Lagrange contributors")
+              ctr_create_3dsx(lagrange_3dsx TARGET app OUTPUT "${CMAKE_BINARY_DIR}/lagrange.3dsx"
+                              SMDH "${CMAKE_BINARY_DIR}/lagrange.smdh" ROMFS "${N3DS_ROMFS}")
           endif()
           EOF
             echo "::group::Foundation process and pipe consumers"
@@ -606,6 +780,7 @@ jobs:
             -DENABLE_GUI=ON -DENABLE_TUI=OFF -DINSTALL_GMGET=OFF \
             -DENABLE_X11_XLIB=OFF -DENABLE_HARFBUZZ=OFF \
             -DENABLE_IPC=OFF -DENABLE_DOWNLOAD_EDIT=OFF -DENABLE_FILE_REVEAL=OFF \
+            -DENABLE_RELATIVE_EMBED=ON \
             -DUNISTRING_DIR="$DEVKITPRO/portlibs/3ds" \
             2>&1 | tee port-report/lagrange-configure.log
           # The toolchain and target portlibs already supply static archives.
@@ -613,8 +788,13 @@ jobs:
           # Record the relevant pinned Foundation source for porting analysis.
           cp lib/the_Foundation/src/address.c port-report/foundation-address.c
           grep -n -E 'ifaddrs|getifaddrs|freeifaddrs|AF_INET6|sockaddr_in6|socketpair|pipe\(' lib/the_Foundation/src/*.c > port-report/foundation-platform-apis.txt || true
-          cmake --build /tmp/lagrange-3ds-build --parallel 2 -- -k \
+          cmake --build /tmp/lagrange-3ds-build --target lagrange_3dsx --parallel 2 -- -k \
             2>&1 | tee port-report/lagrange-build.log
+          test -s /tmp/lagrange-3ds-build/lagrange.3dsx
+          mkdir -p port-report/browser
+          cp /tmp/lagrange-3ds-build/lagrange.3dsx port-report/browser/
+          cp /tmp/lagrange-3ds-build/app/lagrange.elf port-report/browser/
+          sha256sum port-report/browser/* > port-report/browser/SHA256SUMS
 
       - name: Upload diagnostics and smoke-test binary if available
         if: always()
