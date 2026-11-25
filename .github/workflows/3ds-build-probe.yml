@@ -242,6 +242,79 @@ jobs:
           assert s.count(old) == 1, "unexpected OpenSSL default keepalive"
           p.write_text(s.replace(old, "#ifdef SO_KEEPALIVE\n" + old + "\n#endif"))
           PY
+            # Native OS entropy: use the ssl:C random service, as devkitPro's
+            # Mbed TLS port does. Never credit bytes on a failed service call.
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("providers/implementations/rands/seeding/rand_unix.c")
+          s = p.read_text()
+          old = "#else\n\n#if defined(OPENSSL_RAND_SEED_EGD) && (defined(OPENSSL_NO_EGD) || !defined(DEVRANDOM_EGD))"
+          new = """#elif defined(__3DS__)
+
+          #ifndef OPENSSL_RAND_SEED_OS
+          #error "Nintendo 3DS requires native OS entropy"
+          #endif
+          #include <3ds/types.h>
+          #include <3ds/result.h>
+          #include <3ds/synchronization.h>
+          #include <3ds/services/sslc.h>
+
+          /* libctru LightLock uses 1 as the unlocked state. Serialize the
+           * sslc reference-count lifecycle even across concurrent DRBGs. */
+          static LightLock entropy_lock = 1;
+
+          size_t ossl_pool_acquire_entropy(RAND_POOL *pool)
+          {
+              size_t n = ossl_rand_pool_bytes_needed(pool, 1);
+              unsigned char *buffer;
+              Result rc;
+
+              if (n == 0)
+                  return ossl_rand_pool_entropy_available(pool);
+              if (n > UINT32_MAX || n > SIZE_MAX / 8)
+                  return 0;
+              buffer = ossl_rand_pool_add_begin(pool, n);
+              if (buffer == NULL)
+                  return 0;
+
+              LightLock_Lock(&entropy_lock);
+              rc = sslcInit(0);
+              if (R_SUCCEEDED(rc)) {
+                  rc = sslcGenerateRandomData(buffer, (u32)n);
+                  sslcExit();
+              }
+              LightLock_Unlock(&entropy_lock);
+
+              if (R_FAILED(rc)) {
+                  OPENSSL_cleanse(buffer, n);
+                  ossl_rand_pool_add_end(pool, 0, 0);
+                  return 0;
+              }
+              if (!ossl_rand_pool_add_end(pool, n, 8 * n)) {
+                  OPENSSL_cleanse(buffer, n);
+                  return 0;
+              }
+              return ossl_rand_pool_entropy_available(pool);
+          }
+
+          int ossl_rand_pool_init(void)
+          {
+              return 1;
+          }
+
+          void ossl_rand_pool_cleanup(void)
+          {
+          }
+
+          void ossl_rand_pool_keep_random_devices_open(int keep)
+          {
+              (void)keep;
+          }
+
+          """ + old
+          assert s.count(old) == 1, "unexpected OpenSSL entropy backend"
+          p.write_text(s.replace(old, new))
+          PY
             # Generic ARM/newlib target, not a Linux target. Keep thread safety
             # and OS entropy enabled; runtime entropy and TLS need hardware validation.
             cat > Configurations/99-nintendo-3ds.conf <<'EOF'
@@ -249,6 +322,7 @@ jobs:
               "nintendo-3ds" => {
                   inherit_from => [ "gcc" ],
                   thread_scheme => "pthreads",
+                  ex_libs => add("-lctru -lm"),
                   cflags => "-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -mword-relocations -ffunction-sections -fdata-sections",
               },
           );
@@ -267,7 +341,49 @@ jobs:
             arm-none-eabi-objdump -f "$prefix/lib/libcrypto.a" > "$GITHUB_WORKSPACE/port-report/openssl-architecture.txt"
           ) 2>&1 | tee port-report/openssl-build.log
 
+      - name: Link OpenSSL RNG and TLS probe for Nintendo 3DS
+        if: ${{ !cancelled() && steps.openssl.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          (
+            export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/3ds/bin:$PATH"
+            mkdir -p /tmp/3ds-tls-probe
+            cat > /tmp/3ds-tls-probe/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.15)
+          project(lagrange_3ds_tls_probe C)
+          set(OPENSSL_USE_STATIC_LIBS TRUE)
+          find_package(OpenSSL REQUIRED)
+          add_executable(lagrange-3ds-tls-probe main.c)
+          target_link_libraries(lagrange-3ds-tls-probe PRIVATE OpenSSL::SSL OpenSSL::Crypto ctru m)
+          ctr_create_3dsx(lagrange-3ds-tls-probe)
+          EOF
+            cat > /tmp/3ds-tls-probe/main.c <<'EOF'
+          #include <openssl/rand.h>
+          #include <openssl/ssl.h>
+          int main(void)
+          {
+              unsigned char random[32];
+              if (RAND_bytes(random, sizeof(random)) != 1)
+                  return 1;
+              OPENSSL_cleanse(random, sizeof(random));
+              SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+              if (ctx == NULL)
+                  return 2;
+              SSL_CTX_free(ctx);
+              return 0;
+          }
+          EOF
+            cmake -S /tmp/3ds-tls-probe -B /tmp/3ds-tls-build \
+              -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build /tmp/3ds-tls-build --parallel 2
+            test -s /tmp/3ds-tls-build/lagrange-3ds-tls-probe.3dsx
+            cp /tmp/3ds-tls-build/lagrange-3ds-tls-probe.3dsx port-report/
+            sha256sum port-report/*.3dsx > port-report/SHA256SUMS
+          ) 2>&1 | tee port-report/openssl-link.log
+
       - name: Probe unmodified Lagrange configuration
+        if: ${{ !cancelled() && steps.unistring.outcome == 'success' && steps.pcre2.outcome == 'success' && steps.openssl.outcome == 'success' }}
         run: |
           set -euo pipefail
           export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/3ds/bin:$PATH"
