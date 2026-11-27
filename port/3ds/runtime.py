@@ -11,12 +11,31 @@ def edit(path, replacements):
     path.write_text(s)
 
 def sdl(root):
+    # libctru userAppExit runs after newlib's atexit and stdio cleanup.
+    # Keep mounted ROMFS available to late file destructors. Other SDL
+    # executables (including the independent smoke test) retain ownership.
+    edit(root / "src/main/n3ds/SDL_sysmain_runapp.c", [
+        ("int SDL_RunApp(", """extern bool lagrange_3ds_take_romfs_ownership(void) __attribute__((weak));
+
+int SDL_RunApp("""),
+        ("    romfsInit();", """    const bool mounted = R_SUCCEEDED(romfsInit());
+    const bool deferred = mounted && lagrange_3ds_take_romfs_ownership &&
+                          lagrange_3ds_take_romfs_ownership();"""),
+        ("    romfsExit();", "    if (mounted && !deferred) romfsExit();"),
+    ])
     # A guest-side marker proves the dual-display update path was reached.
     edit(root / "src/video/n3ds/SDL_n3dsframebuffer.c", [
-        ('#include "SDL_n3dsvideo.h"', '#include "SDL_n3dsvideo.h"\n#include <3ds/svc.h>\n#include <stdio.h>'),
+        ('#include "SDL_n3dsvideo.h"', '#include "SDL_n3dsvideo.h"\n#include <3ds/svc.h>\n#include <3ds/services/gspgpu.h>\n#include <stdio.h>'),
+        ("        for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {",
+         """        /* The libctru framebuffer swap takes effect on VBlank.
+           Never reuse a pending/front buffer before the previous present. */
+        gspWaitForVBlank();
+        for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {"""),
         ("            FlushN3DSBuffer(dst, fbw * fbh * sizeof(u32), (gfxScreen_t)screen);\n        }\n        return true;",
-         """            FlushN3DSBuffer(dst, fbw * fbh * sizeof(u32), (gfxScreen_t)screen);
+         """            GSPGPU_FlushDataCache(dst, fbw * fbh * sizeof(u32));
         }
+        /* Submit both completed buffers as one dual-screen presentation. */
+        gfxSwapBuffers();
         static bool reported = false;
         if (!reported) {
             static const char marker[] = "LAGRANGE_3DS_FIRST_FRAME";
@@ -348,6 +367,38 @@ static void keyboardTrace_3ds_(const char *message) {
             if (useNative) postCommand_Widget(w, "n3ds.keyboard.open");
 #endif"""),
     ])
+
+    # The workflow currently inserts early socExit calls into main(). They
+    # unregister the device while newlib can still have live descriptors.
+    # Move service ownership to libctru's late application-exit hook.
+    main = root / "app/src/main.c"
+    source = main.read_text()
+    assert source.count("exitSoc_3ds_();") == 6, "unexpected SOC exit sites"
+    source = source.replace("exitSoc_3ds_();", "/* SOC released by userAppExit after stdio cleanup. */")
+    anchor = "int main(int argc, char **argv) {"
+    assert source.count(anchor) == 1
+    source = source.replace(anchor, """#ifdef __3DS__
+#include <3ds/romfs.h>
+static bool romfsOwned_3ds_;
+
+bool lagrange_3ds_take_romfs_ownership(void) {
+    romfsOwned_3ds_ = true;
+    return true;
+}
+
+/* Called by libctru after C exit handlers and stdio cleanup, but before
+   FS and service-manager shutdown. Do not log to files from this hook. */
+void userAppExit(void) {
+    exitSoc_3ds_();
+    if (romfsOwned_3ds_) {
+        romfsExit();
+        romfsOwned_3ds_ = false;
+    }
+}
+#endif
+
+""" + anchor)
+    main.write_text(source)
 
 if __name__ == "__main__":
     if len(sys.argv) != 3 or sys.argv[1] not in ("sdl", "app"):
