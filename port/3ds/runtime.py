@@ -91,6 +91,18 @@ int SDL_RunApp("""),
         return true;"""),
     ])
 
+    # libctru APT runs at 0x31; SDL normally creates workers at the
+    # caller's priority (usually 0x30). On the single usable Old 3DS
+    # application core a runnable worker can starve APT. Limit browser
+    # SDL workers to 0x32 or lower urgency; do NOT globally wrap or
+    # demote libctru service threads or change main-thread priority.
+    edit(root / "src/thread/n3ds/SDL_systhread.c", [
+        ("    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);",
+         """    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+    if (SDL_GetHintBoolean("LAGRANGE_3DS_DUALSCREEN", false) && priority < 0x32)
+        priority = 0x32;"""),
+    ])
+
     # Poll APT before touching the input service; after HOME-close, do not
     # dispatch stale touch events into a browser that is about to shut down.
     edit(root / "src/video/n3ds/SDL_n3dsevents.c", [
@@ -440,6 +452,16 @@ static void keyboardAptHook_3ds_(APT_HookType type, void *unused) {
 #endif"""),
     ])
 
+    # A lower-priority service/worker needs a scheduling opportunity even
+    # when input or animation keeps the UI continuously busy. This is a
+    # real blocking sleep, not a same-priority yield.
+    edit(root / "app/src/app/events.c", [
+        ("        iterate_App_(d);",
+         """        iterate_App_(d);
+#ifdef __3DS__
+        if (d->isRunning) SDL_Delay(1);
+#endif"""),
+    ])
     # Our display backend already paces presentation against pending GSP
     # swaps. SDL software VSync emulation adds another delay on the old 3DS.
     # Surface errors must be visible in the existing startup log, not hidden
