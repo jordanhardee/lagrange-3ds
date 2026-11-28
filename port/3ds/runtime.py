@@ -524,6 +524,58 @@ void userAppExit(void) {
     main.write_text(source)
 
 
+def hardware_crash_app(root):
+    # Verified on physical Old 3DS, diagnostic build 9501bba:
+    # document_App -> document_Root(NULL), ARM11 data abort at offset 0xdc
+    # during custom D-pad link selection, before any keyboard applet.
+    edit(root / "app/src/app/windows.c", [
+        ("iDocumentWidget *document_Root(iRoot *d) {\n",
+         """iDocumentWidget *document_Root(iRoot *d) {
+#ifdef __3DS__
+    if (!d || !d->bars.docTabs) return NULL;
+#endif
+"""),
+        ("    iDocumentWidget *doc = document_Root(get_Root());",
+         """#ifdef __3DS__
+    iDocumentWidget *doc = document_Root(current_Root());
+#else
+    iDocumentWidget *doc = document_Root(get_Root());
+#endif"""),
+    ])
+    edit(root / "app/src/ui/gamepad.c", [
+        ("    return d->window->roots[0];",
+         """    return d->window ? d->window->roots[0] : NULL;"""),
+        ("    if (!isConnected_Gamepad(d)) {\n        return iFalse;\n    }",
+         """    if (!isConnected_Gamepad(d)) {
+        return iFalse;
+    }
+    if (!root_Gamepad_(d)) return iFalse;"""),
+        ("selectLink_3ds_DocumentWidget(document_App(),",
+         "selectLink_3ds_DocumentWidget(document_Root(root_Gamepad_(d)),"),
+        ("openSelectedLink_3ds_DocumentWidget(document_App());",
+         "openSelectedLink_3ds_DocumentWidget(document_Root(root_Gamepad_(d)));"),
+    ])
+    edit(root / "app/src/app/events.c", [
+        ("                if (processEvent_Gamepad(d->gamepad, &ev)) {",
+         """#ifdef __3DS__
+                /* Gamepad processing precedes normal per-window dispatch.
+                   Supply the actual window/root context instead of relying
+                   on the previous event or draw having left it active. */
+                iWindow *oldGamepadWindow = get_Window();
+                iRoot *oldGamepadRoot = current_Root();
+                if (d->window) {
+                    setCurrent_Window(d->window);
+                    if (!current_Root()) setCurrent_Root(d->window->roots[0]);
+                }
+                const iBool gamepadUsed = processEvent_Gamepad(d->gamepad, &ev);
+                setCurrent_Window(oldGamepadWindow);
+                setCurrent_Root(oldGamepadRoot);
+                if (gamepadUsed) {
+#else
+                if (processEvent_Gamepad(d->gamepad, &ev)) {
+#endif"""),
+    ])
+
 def debug_sdl(root):
     # SDL is also used by standalone probes; the browser's logging sink is optional.
     edit(root / "src/video/n3ds/SDL_n3dsframebuffer.c", [
@@ -546,6 +598,43 @@ extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned)
         ("        for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {",
          """        const Uint64 copyStart = SDL_GetTicks();
         for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {"""),
+        ("            GSPGPU_FlushDataCache(dst, fbw * fbh * 3u);",
+         """            /* Measure the actual source image before adding an independent
+               physical-scanout diagnostic. Counts only: no page contents. */
+            if (sample && lagrange_3ds_debug) {
+                unsigned dark = 0, light = 0, other = 0;
+                for (int y = 0; y < 240; y += 4) {
+                    for (int x = 0; x < cols; x += 4) {
+                        const u8 *p = dst + 3 * GetDestOffset(x, y, fbw);
+                        if (p[0] < 16 && p[1] < 16 && p[2] < 16) ++dark;
+                        else if (p[0] > 239 && p[1] > 239 && p[2] > 239) ++light;
+                        else ++other;
+                    }
+                }
+                lagrange_3ds_debug(screen == GFX_TOP ? "TOP_PIXELS dark/light/other"
+                                                    : "BOTTOM_PIXELS dark/light/other",
+                                   dark, light, other);
+            }
+            /* Three 12x8 RGB blocks on each screen, written directly to
+               the native framebuffer, independent of SDL/widget drawing.
+               Diagnostic only; remove once physical scanout is validated. */
+            if (lagrange_3ds_debug) {
+                for (int x = 0; x < 36; ++x) {
+                    for (int y = 0; y < 8; ++y) {
+                        u8 *p = dst + 3 * GetDestOffset(x, y, fbw);
+                        p[0] = x >= 24 ? 255 : 0;
+                        p[1] = x >= 12 && x < 24 ? 255 : 0;
+                        p[2] = x < 12 ? 255 : 0;
+                    }
+                }
+            }
+            const Result flush = GSPGPU_FlushDataCache(dst, fbw * fbh * 3u);
+            if ((sample || R_FAILED(flush)) && lagrange_3ds_debug)
+                lagrange_3ds_debug("FB_FLUSH screen/result/bytes",
+                                   (unsigned)screen, (unsigned)flush, fbw * fbh * 3u);
+            if (R_FAILED(flush))
+                return SDL_SetError("3DS framebuffer cache flush failed: 0x%08x",
+                                    (unsigned)flush);"""),
         ("        gfxSwapBuffers();\n        static bool reported",
          """        gfxSwapBuffers();
         if (sample && lagrange_3ds_debug)
@@ -801,4 +890,5 @@ if __name__ == "__main__":
         debug_sdl(root)
     else:
         app(root)
+        hardware_crash_app(root)
         debug_app(root)
