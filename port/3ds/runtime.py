@@ -523,7 +523,274 @@ void userAppExit(void) {
 """ + anchor)
     main.write_text(source)
 
+
+def debug_sdl(root):
+    # SDL is also used by standalone probes; the browser's logging sink is optional.
+    edit(root / "src/video/n3ds/SDL_n3dsframebuffer.c", [
+        ("#include <stdio.h>", """#include <stdio.h>
+extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned)
+    __attribute__((weak));"""),
+        ("        if (!gspHasGpuRight()) return true;\n        const Uint64 deadline",
+         """        static Uint64 lastSample;
+        const Uint64 begin = SDL_GetTicks();
+        const bool sample = !lastSample || begin - lastSample >= 2000;
+        if (sample) {
+            lastSample = begin;
+            if (lagrange_3ds_debug)
+                lagrange_3ds_debug("FB_BEGIN gpu/topPending/bottomPending",
+                    gspHasGpuRight(), gspIsPresentPending(GFX_TOP),
+                    gspIsPresentPending(GFX_BOTTOM));
+        }
+        if (!gspHasGpuRight()) return true;
+        const Uint64 deadline"""),
+        ("        for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {",
+         """        const Uint64 copyStart = SDL_GetTicks();
+        for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {"""),
+        ("        gfxSwapBuffers();\n        static bool reported",
+         """        gfxSwapBuffers();
+        if (sample && lagrange_3ds_debug)
+            lagrange_3ds_debug("FB_END waitMs/copySwapMs/format",
+                (unsigned)(copyStart - begin), (unsigned)(SDL_GetTicks() - copyStart),
+                (unsigned)gfxGetScreenFormat(GFX_TOP));
+        static bool reported"""),
+    ])
+    edit(root / "src/video/n3ds/SDL_n3dsevents.c", [
+        ("#include <3ds.h>", """#include <3ds.h>
+extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned)
+    __attribute__((weak));"""),
+        ("    if (!aptMainLoop()) {", """    if (!aptMainLoop()) {
+        static bool reportedClose;
+        if (!reportedClose && lagrange_3ds_debug) {
+            lagrange_3ds_debug("APT_MAINLOOP_CLOSE", 0, 0, 0);
+            reportedClose = true;
+        }"""),
+    ])
+
+def debug_app(root):
+    main = root / "app/src/main.c"
+    edit(main, [
+        ("static void trace_3ds_(const char *message) {",
+         """/* Diagnostic build: bounded, local, numeric-only logging. Close each
+   record so ordinary crashes leave a usable file. TryLock avoids blocking
+   a system callback on another thread's diagnostic I/O. */
+#include <3ds/os.h>
+#include <3ds/allocator/linear.h>
+#include <3ds/services/apt.h>
+#include <3ds/synchronization.h>
+#include <malloc.h>
+#define DEBUG_PATH_3DS "sdmc:/3ds/lagrange/debug.log"
+#define DEBUG_PREV_3DS "sdmc:/3ds/lagrange/debug-prev.log"
+#define DEBUG_LIMIT_3DS (256u * 1024u)
+static LightLock debugLock_3ds_ = 1;
+static bool debugEnabled_3ds_;
+static unsigned debugBytes_3ds_;
+static u64 debugStart_3ds_;
+static aptHookCookie debugHook_3ds_;
+static bool debugHooked_3ds_;
+
+void lagrange_3ds_debug(const char *event, unsigned a, unsigned b, unsigned c) {
+    if (LightLock_TryLock(&debugLock_3ds_) != 0) return;
+    if (debugEnabled_3ds_ && debugBytes_3ds_ < DEBUG_LIMIT_3DS - 256) {
+        FILE *file = fopen(DEBUG_PATH_3DS, "a");
+        if (file) {
+            unsigned long long ms = (svcGetSystemTick() - debugStart_3ds_) /
+                                    (SYSCLOCK_ARM11 / 1000u);
+            int n = fprintf(file, "%llu %s %u %u %u\\\\n", ms, event, a, b, c);
+            if (n > 0) debugBytes_3ds_ += (unsigned)n;
+            fclose(file);
+        }
+    }
+    LightLock_Unlock(&debugLock_3ds_);
+}
+static void debugApt_3ds_(APT_HookType type, void *unused) {
+    (void)unused;
+    switch (type) {
+        case APTHOOK_ONSUSPEND: lagrange_3ds_debug("APT_SUSPEND", 0, 0, 0); break;
+        case APTHOOK_ONRESTORE: lagrange_3ds_debug("APT_RESTORE", 0, 0, 0); break;
+        case APTHOOK_ONSLEEP: lagrange_3ds_debug("APT_SLEEP", 0, 0, 0); break;
+        case APTHOOK_ONWAKEUP: lagrange_3ds_debug("APT_WAKE", 0, 0, 0); break;
+        case APTHOOK_ONEXIT: lagrange_3ds_debug("APT_EXIT", 0, 0, 0); break;
+        default: break;
+    }
+}
+static void debugStart_3ds_(void) {
+    if (debugEnabled_3ds_) return;
+    struct stat st;
+    if (stat(DEBUG_PATH_3DS, &st) == 0) {
+        remove(DEBUG_PREV_3DS);
+        if (rename(DEBUG_PATH_3DS, DEBUG_PREV_3DS) != 0) return;
+    }
+    FILE *file = fopen(DEBUG_PATH_3DS, "w");
+    if (!file) return;
+    fclose(file);
+    debugStart_3ds_ = svcGetSystemTick();
+    debugEnabled_3ds_ = true;
+    bool new3ds = false;
+    s32 priority = -1;
+    APT_CheckNew3DS(&new3ds);
+    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+    lagrange_3ds_debug("DEBUG_START schema/new3ds/mainPriority", 1, new3ds, (unsigned)priority);
+    aptHook(&debugHook_3ds_, debugApt_3ds_, NULL);
+    debugHooked_3ds_ = true;
+}
+void lagrange_3ds_debug_memory(void) {
+    const struct mallinfo m = mallinfo();
+    lagrange_3ds_debug("MEMORY heapUsed/heapFreeInArena/linearFree",
+                       (unsigned)m.uordblks, (unsigned)m.fordblks, linearSpaceFree());
+}
+static void trace_3ds_(const char *message) {
+    /* Only fixed milestone strings (not OpenSSL's arbitrary error text). */
+    if (strncmp(message, "LAGRANGE_3DS_", 13) == 0)
+        lagrange_3ds_debug(message, 0, 0, 0);"""),
+        ("    if (!initSoc_3ds_()) {",
+         """    debugStart_3ds_();
+    lagrange_3ds_debug("SOC_INIT_BEGIN", 0, 0, 0);
+    if (!initSoc_3ds_()) {
+        lagrange_3ds_debug("SOC_INIT_FAILED", 0, 0, 0);"""),
+        ("    /* Foundation assumes SSL_CTX_new succeeds.",
+         """    debugStart_3ds_();
+    lagrange_3ds_debug("SOC_STORAGE_READY", 0, 0, 0);
+    lagrange_3ds_debug_memory();
+    /* Foundation assumes SSL_CTX_new succeeds."""),
+        ("    if (!SDL_Init(SDL_INIT_VIDEO)) {",
+         """#ifdef __3DS__
+    lagrange_3ds_debug("SDL_INIT_BEGIN", 0, 0, 0);
+#endif
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+#ifdef __3DS__
+        lagrange_3ds_debug("SDL_INIT_FAILED", 0, 0, 0);
+#endif"""),
+        ("    init_Updater();\n    run_App(argc, argv);\n    SDL_Quit();",
+         """#ifdef __3DS__
+    lagrange_3ds_debug("SDL_INIT_OK", 0, 0, 0);
+#endif
+    init_Updater();
+    run_App(argc, argv);
+#ifdef __3DS__
+    lagrange_3ds_debug("APP_RETURN_SDL_QUIT_BEGIN", 0, 0, 0);
+#endif
+    SDL_Quit();
+#ifdef __3DS__
+    lagrange_3ds_debug("SDL_QUIT_END", 0, 0, 0);
+#endif"""),
+        ("    deinit_Updater();\n    deinit_Core();\n    deinit_Foundation();",
+         """    deinit_Updater();
+#ifdef __3DS__
+    lagrange_3ds_debug("CORE_DEINIT_BEGIN", 0, 0, 0);
+#endif
+    deinit_Core();
+#ifdef __3DS__
+    lagrange_3ds_debug("FOUNDATION_DEINIT_BEGIN", 0, 0, 0);
+#endif
+    deinit_Foundation();
+#ifdef __3DS__
+    lagrange_3ds_debug("FOUNDATION_DEINIT_END", 0, 0, 0);
+    if (debugHooked_3ds_) {
+        aptUnhook(&debugHook_3ds_);
+        debugHooked_3ds_ = false;
+    }
+    lagrange_3ds_debug("MAIN_RETURN", 0, 0, 0);
+#endif"""),
+    ])
+    edit(root / "app/src/ui/inputwidget.c", [
+        ("static void keyboardTrace_3ds_(const char *message) {",
+         """extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned);
+static void keyboardTrace_3ds_(const char *message) {
+    /* The caller supplies fixed lifecycle markers or numeric result codes,
+       never initial text, submitted text, or the URL. */
+    lagrange_3ds_debug(message, 0, 0, 0);"""),
+    ])
+    edit(root / "app/src/app/startup.c", [
+        ("int run_App(int argc, char **argv) {",
+         """#ifdef __3DS__
+extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned);
+#endif
+int run_App(int argc, char **argv) {
+#ifdef __3DS__
+    lagrange_3ds_debug("APP_INIT_BEGIN", 0, 0, 0);
+#endif"""),
+        ("    const int rc = run_App_(&app_);\n    deinit_App_(&app_);",
+         """#ifdef __3DS__
+    lagrange_3ds_debug("APP_INIT_OK_LOOP_BEGIN", 0, 0, 0);
+#endif
+    const int rc = run_App_(&app_);
+#ifdef __3DS__
+    lagrange_3ds_debug("APP_LOOP_END_DEINIT_BEGIN", (unsigned)rc, 0, 0);
+#endif
+    deinit_App_(&app_);
+#ifdef __3DS__
+    lagrange_3ds_debug("APP_DEINIT_END", 0, 0, 0);
+#endif"""),
+    ])
+    edit(root / "app/src/app/events.c", [
+        ("static void iterate_App_(void *app) {",
+         """#ifdef __3DS__
+extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned);
+extern void lagrange_3ds_debug_memory(void);
+#endif
+static void iterate_App_(void *app) {
+#ifdef __3DS__
+    static Uint64 nextSample;
+    const Uint64 t0 = SDL_GetTicks();
+    const iBool sample = t0 >= nextSample;
+    if (sample) {
+        nextSample = t0 + 2000;
+        lagrange_3ds_debug("LOOP_BEGIN", 0, 0, 0);
+        lagrange_3ds_debug_memory();
+    }
+#endif"""),
+        ("    processEvents_App(waitForNewEvents_AppEventMode);\n    endPhase_FrameTiming(events_FramePhase);",
+         """    processEvents_App(waitForNewEvents_AppEventMode);
+#ifdef __3DS__
+    const Uint64 t1 = SDL_GetTicks();
+    if (sample) lagrange_3ds_debug("EVENTS_END ms", (unsigned)(t1 - t0), 0, 0);
+#endif
+    endPhase_FrameTiming(events_FramePhase);"""),
+        ("    refresh_App();\n    endPhase_FrameTiming(draw_FramePhase);",
+         """#ifdef __3DS__
+    const Uint64 t2 = SDL_GetTicks();
+    if (sample) lagrange_3ds_debug("DRAW_BEGIN tickersMs", (unsigned)(t2 - t1), 0, 0);
+#endif
+    refresh_App();
+#ifdef __3DS__
+    if (sample) lagrange_3ds_debug("DRAW_END ms", (unsigned)(SDL_GetTicks() - t2), 0, 0);
+#endif
+    endPhase_FrameTiming(draw_FramePhase);"""),
+    ])
+    edit(root / "app/src/ui/window.c", [
+        ("static void present_Window_(SDL_Renderer *render) {",
+         """#ifdef __3DS__
+extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned);
+#endif
+static void present_Window_(SDL_Renderer *render) {"""),
+        ("            reported = iTrue;\n        }\n    }\n#else\n    SDL_RenderPresent(render);",
+         """            lagrange_3ds_debug("PRESENT_FAILED", 0, 0, 0);
+            reported = iTrue;
+        }
+    }
+#else
+    SDL_RenderPresent(render);"""),
+    ])
+    # This source is compiled for the standalone TLS probe before app()
+    # is run, so the browser-only instrumentation does not affect that probe.
+    edit(root / "port/3ds/pthread-tls.c", [
+        ("Thread __wrap_threadCreate(ThreadFunc entry, void *arg, size_t stack,",
+         """extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned);
+Thread __wrap_threadCreate(ThreadFunc entry, void *arg, size_t stack,"""),
+        ("    if (!thread) free(start);\n    return thread;",
+         """    if (!thread) free(start);
+    lagrange_3ds_debug(thread ? "THREAD_CREATE priority/core/stack" : "THREAD_CREATE_FAILED priority/core/stack",
+                       (unsigned)priority, (unsigned)core, (unsigned)stack);
+    return thread;"""),
+    ])
+
 if __name__ == "__main__":
     if len(sys.argv) != 3 or sys.argv[1] not in ("sdl", "app"):
         raise SystemExit("usage: runtime.py {sdl|app} SOURCE_ROOT")
-    (sdl if sys.argv[1] == "sdl" else app)(Path(sys.argv[2]))
+    root = Path(sys.argv[2])
+    if sys.argv[1] == "sdl":
+        sdl(root)
+        debug_sdl(root)
+    else:
+        app(root)
+        debug_app(root)
