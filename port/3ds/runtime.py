@@ -29,7 +29,17 @@ int SDL_RunApp("""),
         ("        for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {",
          """        /* The libctru framebuffer swap takes effect on VBlank.
            Never reuse a pending/front buffer before the previous present. */
-        gspWaitForVBlank();
+        /* APT may temporarily revoke GPU rights (HOME or keyboard).
+           Waiting for VBlank alone does not prove either queued swap has
+           been consumed. Never overwrite a buffer still pending display. */
+        if (!gspHasGpuRight()) return true;
+        const Uint64 deadline = SDL_GetTicks() + 100;
+        while (gspIsPresentPending(GFX_TOP) || gspIsPresentPending(GFX_BOTTOM)) {
+            if (!gspHasGpuRight()) return true;
+            if (SDL_GetTicks() >= deadline)
+                return SDL_SetError("3DS framebuffer presentation timed out");
+            SDL_Delay(1);
+        }
         for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {"""),
         ("            FlushN3DSBuffer(dst, fbw * fbh * sizeof(u32), (gfxScreen_t)screen);\n        }\n        return true;",
          """            GSPGPU_FlushDataCache(dst, fbw * fbh * sizeof(u32));
@@ -48,6 +58,26 @@ int SDL_RunApp("""),
             reported = true;
         }
         return true;"""),
+    ])
+
+    # Poll APT before touching the input service; after HOME-close, do not
+    # dispatch stale touch events into a browser that is about to shut down.
+    edit(root / "src/video/n3ds/SDL_n3dsevents.c", [
+        ("""    hidScanInput();
+    N3DS_PollTouch(_this);
+
+    if (!aptMainLoop()) {""",
+         """    if (!aptMainLoop()) {"""),
+        ("""        SDL_PushEvent(&ev);
+        return;
+    }
+}""",
+         """        SDL_PushEvent(&ev);
+        return;
+    }
+    hidScanInput();
+    N3DS_PollTouch(_this);
+}"""),
     ])
 
     # ARM EABI uses short enums. Lagrange carries private scroll flags in
@@ -368,6 +398,35 @@ static void keyboardTrace_3ds_(const char *message) {
 #endif"""),
     ])
 
+    # Our display backend already paces presentation against pending GSP
+    # swaps. SDL software VSync emulation adds another delay on the old 3DS.
+    # Surface errors must be visible in the existing startup log, not hidden
+    # by an unchecked SDL_RenderPresent return value.
+    edit(root / "app/src/ui/window.c", [
+        ("    SDL_SetRenderVSync(d->render, 1);",
+         """#ifdef __3DS__
+    SDL_SetRenderVSync(d->render, 0);
+#else
+    SDL_SetRenderVSync(d->render, 1);
+#endif"""),
+        ("    SDL_RenderPresent(render);",
+         """#ifdef __3DS__
+    if (!SDL_RenderPresent(render)) {
+        static iBool reported;
+        if (!reported) {
+            fprintf(stderr, "[3DS] SDL_RenderPresent: %s\\n", SDL_GetError());
+            FILE *log = fopen("sdmc:/3ds/lagrange/cache/startup.log", "a");
+            if (log) {
+                fprintf(log, "LAGRANGE_3DS_PRESENT_FAILED %s\\n", SDL_GetError());
+                fclose(log);
+            }
+            reported = iTrue;
+        }
+    }
+#else
+    SDL_RenderPresent(render);
+#endif"""),
+    ])
     # The workflow currently inserts early socExit calls into main(). They
     # unregister the device while newlib can still have live descriptors.
     # Move service ownership to libctru's late application-exit hook.
