@@ -147,31 +147,26 @@ def press(key, duration=0.15):
 
 
 def keyboard_box(img, top):
-    # Pinned Qt HLE keyboard: locate the light-gray 200x94 dialog on
-    # the black applet background (verified against run 45700896528).
-    cx = (top[0] + top[2]) // 2
-    for y in range(top[1] + 100, top[1] + 300):
-        def gray(x, yy):
-            r, g, b = img.getpixel((x, yy))
-            return 220 <= r <= 249 and abs(r-g) <= 3 and abs(r-b) <= 3
-        def dark(x, yy):
-            return max(img.getpixel((x, yy))) < 40
-        if not gray(cx, y) or not dark(cx, y - 1):
-            continue
-        left = right = cx
-        while left > cx - 350 and gray(left - 1, y):
-            left -= 1
-        while right < cx + 350 and gray(right, y):
-            right += 1
-        if not 180 <= right - left <= 350:
-            continue
-        bottom = y
-        while bottom < y + 160 and gray(left + 2, bottom):
-            bottom += 1
-        if 75 <= bottom - y <= 150 and dark(left - 1, y + 5) and dark(right, y + 5):
-            return left, y, right, bottom
+    # The native Qt dialog is a distinct, small focused X11 window.
+    # Do not assume black pixels surround it: saved failure screenshots
+    # show a valid dialog over the white Lagrange page. Check geometry
+    # and the dialog's own light-gray border instead.
+    try:
+        geom = dict(line.split("=", 1) for line in
+                    run("xdotool", "getwindowgeometry", "--shell", focus()).splitlines()
+                    if "=" in line)
+        x, y, w, h = (int(geom[k]) for k in ("X", "Y", "WIDTH", "HEIGHT"))
+        if not (180 <= w <= 350 and 75 <= h <= 150):
+            return None
+        if not (0 <= x < x+w <= img.width and 0 <= y < y+h <= img.height):
+            return None
+        # Ignore the underlying app's color; validate the dialog itself.
+        r, g, b = img.getpixel((x + 3, y + 3))
+        if 220 <= r <= 249 and abs(r-g) <= 3 and abs(r-b) <= 3:
+            return x, y, x+w, y+h
+    except (KeyError, ValueError, subprocess.SubprocessError):
+        pass
     return None
-
 
 def open_keyboard(top, bottom, name):
     click(bottom[0] + 100, bottom[1] + 23)
@@ -219,7 +214,7 @@ def finish_keyboard(box, top, main_window, submit, address=""):
         raise AssertionError(f"Unexpected software keyboard result: {line}; expected {expected}")
     # Host dialog completion is not proof the guest returned from libctru.
     # Require the corresponding guest result and resume before proceeding.
-    path = Path(os.environ["XDG_DATA_HOME"]) / "azahar-emu" / "log" / "azahar_log.txt"
+    path = DATA / "debug.log"
     expected_guest = "LAGRANGE_3DS_SWKBD_CONFIRM" if submit else "LAGRANGE_3DS_SWKBD_CANCEL"
     expected_launches = 2 if submit else 1
     def guest_resumed():
