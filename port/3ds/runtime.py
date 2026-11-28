@@ -23,6 +23,25 @@ int SDL_RunApp("""),
                           lagrange_3ds_take_romfs_ownership();"""),
         ("    romfsExit();", "    if (mounted && !deferred) romfsExit();"),
     ])
+    # Keep SDL's RGBA8888 logical canvas but use native BGR8 scanout.
+    # Azahar's GSP SaveVramSysArea explicitly clears 4-byte framebuffer
+    # formats. libctru's default BGR8 also matches normal applet capture.
+    edit(root / "src/video/n3ds/SDL_n3dsvideo.c", [
+        ("    gfxInit(GSP_RGBA8_OES, GSP_RGBA8_OES, false);",
+         """    if (SDL_GetHintBoolean("LAGRANGE_3DS_DUALSCREEN", false))
+        gfxInit(GSP_BGR8_OES, GSP_BGR8_OES, false);
+    else
+        gfxInit(GSP_RGBA8_OES, GSP_RGBA8_OES, false);"""),
+        ("""    gfxSetScreenFormat(displaydata->screen, modedata->fmt);
+    if (SDL_GetHintBoolean("LAGRANGE_3DS_DUALSCREEN", false))
+        gfxSetScreenFormat(GFX_BOTTOM, modedata->fmt);""",
+         """    if (SDL_GetHintBoolean("LAGRANGE_3DS_DUALSCREEN", false)) {
+        gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);
+        gfxSetScreenFormat(GFX_BOTTOM, GSP_BGR8_OES);
+    } else {
+        gfxSetScreenFormat(displaydata->screen, modedata->fmt);
+    }"""),
+    ])
     # A guest-side marker proves the dual-display update path was reached.
     edit(root / "src/video/n3ds/SDL_n3dsframebuffer.c", [
         ('#include "SDL_n3dsvideo.h"', '#include "SDL_n3dsvideo.h"\n#include <3ds/svc.h>\n#include <3ds/services/gspgpu.h>\n#include <stdio.h>'),
@@ -41,8 +60,20 @@ int SDL_RunApp("""),
             SDL_Delay(1);
         }
         for (int screen = GFX_TOP; screen <= GFX_BOTTOM; ++screen) {"""),
+        ("            u32 *dst = (u32 *)gfxGetFramebuffer((gfxScreen_t)screen, GFX_LEFT, &fbw, &fbh);",
+         """            u8 *dst = gfxGetFramebuffer((gfxScreen_t)screen, GFX_LEFT, &fbw, &fbh);
+            if (gfxGetScreenFormat((gfxScreen_t)screen) != GSP_BGR8_OES)
+                return SDL_SetError("Unexpected 3DS scanout format");"""),
+        ("                    dst[GetDestOffset(x, y, fbw)] = src[sx];",
+         """                    /* RGBA8888 is a packed 0xRRGGBBAA word. The
+                       native BGR8 framebuffer stores B, G, R bytes. */
+                    const u32 pixel = src[sx];
+                    u8 *out = dst + 3 * GetDestOffset(x, y, fbw);
+                    out[0] = (u8)(pixel >> 8);
+                    out[1] = (u8)(pixel >> 16);
+                    out[2] = (u8)(pixel >> 24);"""),
         ("            FlushN3DSBuffer(dst, fbw * fbh * sizeof(u32), (gfxScreen_t)screen);\n        }\n        return true;",
-         """            GSPGPU_FlushDataCache(dst, fbw * fbh * sizeof(u32));
+         """            GSPGPU_FlushDataCache(dst, fbw * fbh * 3u);
         }
         /* Submit both completed buffers as one dual-screen presentation. */
         gfxSwapBuffers();
@@ -313,6 +344,7 @@ enum iMouseWheelFlag {"""),
          """#include "input/impl.h"
 #ifdef __3DS__
 #include <3ds/applets/swkbd.h>
+#include <3ds/services/apt.h>
 #include <3ds/svc.h>
 #include <SDL3/SDL_hints.h>
 #include <string.h>
@@ -323,6 +355,13 @@ static iBool nativeKeyboardActive_3ds_;
 static uint64_t nativeKeyboardClosed_3ds_;
 static void keyboardTrace_3ds_(const char *message) {
     svcOutputDebugString(message, strlen(message));
+}
+static void keyboardAptHook_3ds_(APT_HookType type, void *unused) {
+    (void) unused;
+    if (type == APTHOOK_ONSUSPEND)
+        keyboardTrace_3ds_("LAGRANGE_3DS_SWKBD_APT_SUSPEND");
+    else if (type == APTHOOK_ONRESTORE)
+        keyboardTrace_3ds_("LAGRANGE_3DS_SWKBD_APT_RESTORE");
 }
 #endif"""),
         ("    if (isCommand_Widget(w, ev, \"focus.gained\")) {",
@@ -343,7 +382,10 @@ static void keyboardTrace_3ds_(const char *message) {
         swkbdSetButton(&keyboard, SWKBD_BUTTON_CONFIRM, "OK", true);
         nativeKeyboardActive_3ds_ = iTrue;
         keyboardTrace_3ds_("LAGRANGE_3DS_SWKBD_OPEN");
+        aptHookCookie cookie;
+        aptHook(&cookie, keyboardAptHook_3ds_, NULL);
         const SwkbdButton button = swkbdInputText(&keyboard, result, sizeof(result));
+        aptUnhook(&cookie);
         nativeKeyboardClosed_3ds_ = SDL_GetTicks();
         SDL_SetHint("LAGRANGE_3DS_TOUCH_REARM", "1");
         char marker[96];
