@@ -569,6 +569,12 @@ extern void lagrange_3ds_debug(const char *, unsigned, unsigned, unsigned)
 def debug_app(root):
     main = root / "app/src/main.c"
     edit(main, [
+        ("void userAppExit(void) {",
+         """void userAppExit(void) {
+    if (debugHooked_3ds_) {
+        aptUnhook(&debugHook_3ds_);
+        debugHooked_3ds_ = false;
+    }"""),
         ("static void trace_3ds_(const char *message) {",
          """/* Diagnostic build: bounded, local, numeric-only logging. Close each
    record so ordinary crashes leave a usable file. TryLock avoids blocking
@@ -595,7 +601,7 @@ void lagrange_3ds_debug(const char *event, unsigned a, unsigned b, unsigned c) {
         if (file) {
             unsigned long long ms = (svcGetSystemTick() - debugStart_3ds_) /
                                     (SYSCLOCK_ARM11 / 1000u);
-            int n = fprintf(file, "%llu %s %u %u %u\\\\n", ms, event, a, b, c);
+            int n = fprintf(file, "%llu %s %u %u %u\\n", ms, event, a, b, c);
             if (n > 0) debugBytes_3ds_ += (unsigned)n;
             fclose(file);
         }
@@ -623,8 +629,10 @@ static void debugStart_3ds_(void) {
     FILE *file = fopen(DEBUG_PATH_3DS, "w");
     if (!file) return;
     fclose(file);
+    LightLock_Lock(&debugLock_3ds_);
     debugStart_3ds_ = svcGetSystemTick();
     debugEnabled_3ds_ = true;
+    LightLock_Unlock(&debugLock_3ds_);
     bool new3ds = false;
     s32 priority = -1;
     APT_CheckNew3DS(&new3ds);
