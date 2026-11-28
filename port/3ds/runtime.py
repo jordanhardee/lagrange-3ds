@@ -590,7 +590,7 @@ def debug_app(root):
 static LightLock debugLock_3ds_ = 1;
 static bool debugEnabled_3ds_;
 static unsigned debugBytes_3ds_;
-static u64 debugStart_3ds_;
+static u64 debugStartTick_3ds_;
 static aptHookCookie debugHook_3ds_;
 static bool debugHooked_3ds_;
 
@@ -599,7 +599,7 @@ void lagrange_3ds_debug(const char *event, unsigned a, unsigned b, unsigned c) {
     if (debugEnabled_3ds_ && debugBytes_3ds_ < DEBUG_LIMIT_3DS - 256) {
         FILE *file = fopen(DEBUG_PATH_3DS, "a");
         if (file) {
-            unsigned long long ms = (svcGetSystemTick() - debugStart_3ds_) /
+            unsigned long long ms = (svcGetSystemTick() - debugStartTick_3ds_) /
                                     (SYSCLOCK_ARM11 / 1000u);
             int n = fprintf(file, "%llu %s %u %u %u\\n", ms, event, a, b, c);
             if (n > 0) debugBytes_3ds_ += (unsigned)n;
@@ -630,7 +630,7 @@ static void debugStart_3ds_(void) {
     if (!file) return;
     fclose(file);
     LightLock_Lock(&debugLock_3ds_);
-    debugStart_3ds_ = svcGetSystemTick();
+    debugStartTick_3ds_ = svcGetSystemTick();
     debugEnabled_3ds_ = true;
     LightLock_Unlock(&debugLock_3ds_);
     bool new3ds = false;
